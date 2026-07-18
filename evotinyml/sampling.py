@@ -55,6 +55,17 @@ class MixedWeightSampling(Sampling):
         return X
 
 
+class ZeroWeightSampling(Sampling):
+    """Initialize every individual at the zero vector (``init_sigma`` unused)."""
+
+    def __init__(self, sigma: float = 0.1) -> None:
+        super().__init__()
+        self.sigma = float(sigma)
+
+    def _do(self, problem, n_samples, **kwargs):
+        return np.zeros((n_samples, problem.n_var), dtype=np.float64)
+
+
 def get_population_init(name: str, init_sigma: float = 0.1) -> Sampling:
     name = name.lower()
     if name == "uniform":
@@ -63,6 +74,9 @@ def get_population_init(name: str, init_sigma: float = 0.1) -> Sampling:
         return GaussianWeightSampling(sigma=init_sigma)
     if name in {"both", "mixed"}:
         return MixedWeightSampling(sigma=init_sigma)
+    if name in {"zeros", "zero"}:
+        return ZeroWeightSampling(sigma=init_sigma)
     raise ValueError(
-        f"Unknown population init: {name!r}. Use 'uniform', 'gaussian', or 'both'."
+        f"Unknown population init: {name!r}. "
+        "Use 'uniform', 'gaussian', 'both', or 'zeros'."
     )

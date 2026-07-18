@@ -11,10 +11,14 @@ from evotinyml.algorithms import OperatorConfig
 
 DEFAULT_ENTITY = "rasa_research"
 DEFAULT_PROJECT = "EvoTinyML-Precision-Recall"
+# W&B x-axis key (function evaluations).
+FE_METRIC = "Function Evaluations"
 
 
-def make_run_name(dataset: str, algo: str, seed: int) -> str:
-    """Format: mnist-nsga2-seed0"""
+def make_run_name(dataset: str, algo: str, seed: int, name: str | None = None) -> str:
+    """Format: mnist-nsga2-seed0 (or an explicit override)."""
+    if name:
+        return str(name)
     return f"{dataset}-{algo}-seed{seed}"
 
 
@@ -64,6 +68,7 @@ def build_wandb_config(
         "init": args.init,
         "init_sigma": getattr(args, "init_sigma", 0.1),
         "steps": args.steps,
+        "evals": getattr(args, "evals", None),
         "popsize": args.popsize,
         "batch_size": args.batch_size,
         "eval_mode": getattr(args, "eval_mode", "single"),
@@ -71,7 +76,8 @@ def build_wandb_config(
         "resample_every": args.resample_every,
         "val_every": args.val_every,
         "pareto_every": getattr(args, "pareto_every", 100),
-        "pareto_history": getattr(args, "pareto_history", "history.npz"),
+        "train_history": getattr(args, "train_history", "train_history.npz"),
+        "val_history": getattr(args, "val_history", "val_history.npz"),
         "val_batch_size": args.val_batch_size,
         "seed": args.seed,
         "device": args.device,
@@ -91,6 +97,7 @@ def build_wandb_config(
         "nsga2": nsga2_config,
         "nsga3": nsga3_config,
         "algo_config": algo_config or (nsga2_config if args.algo == "nsga2" else nsga3_config),
+        "wandb_x_axis": FE_METRIC,
     }
     return config
 
@@ -108,7 +115,9 @@ def init_wandb(
     if not enabled:
         return None
 
-    run_name = make_run_name(args.dataset, args.algo, args.seed)
+    run_name = make_run_name(
+        args.dataset, args.algo, args.seed, getattr(args, "wandb_name", None)
+    )
     config = build_wandb_config(
         args,
         n_var=n_var,
@@ -123,34 +132,58 @@ def init_wandb(
         config=config,
         reinit=True,
     )
-    define_wandb_step_metric(int(args.steps))
+    define_wandb_n_eval_metric()
     return run
 
 
+def define_wandb_n_eval_metric(max_n_eval: int | None = None) -> None:
+    """Register function evaluations as the global W&B x-axis."""
+    if wandb.run is None:
+        return
+    wandb.define_metric(FE_METRIC)
+    wandb.define_metric("*", step_metric=FE_METRIC)
+    if max_n_eval is not None:
+        wandb.run.config.update(
+            {"wandb_max_function_evaluations": int(max_n_eval)}, allow_val_change=True
+        )
+
+
 def to_wandb_step(n_gen: int, max_steps: int | None = None) -> int:
-    """Map pymoo ``n_gen`` to a 0-indexed W&B step (0 = init, 1 = first opt)."""
+    """Map pymoo ``n_gen`` to a 0-indexed opt step (0 = init, 1 = first opt).
+
+    Kept for history / scheduling; W&B x-axis uses ``Function Evaluations``.
+    """
     step = max(0, int(n_gen) - 1)
     if max_steps is not None:
         step = min(step, int(max_steps))
     return step
 
 
-def define_wandb_step_metric(max_steps: int) -> None:
-    """Register global step axis: 0 = init pop, 1..max_steps = optimization."""
-    if wandb.run is None:
-        return
-    wandb.define_metric("step")
-    wandb.define_metric("*", step_metric="step")
-    wandb.run.config.update({"wandb_max_step": int(max_steps)}, allow_val_change=True)
+# Backward-compatible alias.
+define_wandb_step_metric = define_wandb_n_eval_metric
 
 
-def log_metrics(metrics: dict[str, Any], step: int | None = None) -> None:
+def log_metrics(
+    metrics: dict[str, Any],
+    *,
+    n_eval: int | None = None,
+    step: int | None = None,
+) -> None:
+    """Log metrics against ``Function Evaluations``.
+
+    ``step`` is accepted as a deprecated alias for ``n_eval``.
+    """
     if wandb.run is None:
         return
     payload = dict(metrics)
-    if step is not None:
-        payload["step"] = int(step)
-    wandb.log(payload, step=step)
+    fe = n_eval if n_eval is not None else step
+    if fe is not None:
+        fe = int(fe)
+        payload[FE_METRIC] = fe
+        payload.setdefault("train/n_eval", fe)
+        wandb.log(payload, step=fe)
+    else:
+        wandb.log(payload)
 
 
 def finish_wandb(summary: dict[str, Any] | None = None) -> None:

@@ -9,7 +9,7 @@ from pymoo.util.display.output import Output
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 from torch.utils.data import DataLoader
 
-from evotinyml.pareto_history import ParetoFrontHistory
+from evotinyml.pareto_history import FrontHistory
 from evotinyml.problem import PR_PROBLEMS, WeightOptimizationProblem
 from evotinyml.validation import validate_nd_set
 from evotinyml.wandb_logger import log_metrics, to_wandb_step
@@ -79,11 +79,12 @@ class StepOutput(Output):
         test_loader: DataLoader | None = None,
         val_every: int = 50,
         n_classes: int = 10,
-        problem_name: str = "per_class_ce",
+        problem_name: str = "cwrm_cross_entropy",
         use_wandb: bool = False,
         max_steps: int | None = None,
         pareto_every: int = 100,
-        pareto_history_path: str | None = "history.npz",
+        train_history_path: str = "train_history.npz",
+        val_history_path: str = "val_history.npz",
     ) -> None:
         super().__init__()
         self.problem_name = problem_name
@@ -91,11 +92,15 @@ class StepOutput(Output):
         self.use_wandb = use_wandb
         self.max_steps = int(max_steps) if max_steps is not None else None
         self.pareto_every = max(1, int(pareto_every))
-        self.pareto_history = (
-            ParetoFrontHistory(pareto_history_path)
-            if self.is_precision_recall and pareto_history_path
-            else None
+        # Always persist train/val front histories for P–R problems.
+        self.train_history = (
+            FrontHistory(train_history_path) if self.is_precision_recall else None
         )
+        self.val_history = (
+            FrontHistory(val_history_path) if self.is_precision_recall else None
+        )
+        # Alias used by older call sites / prints.
+        self.pareto_history = self.train_history
 
         self.step = Column("step", width=8)
         self.n_eval = Column("n_eval", width=10)
@@ -165,7 +170,7 @@ class StepOutput(Output):
         self._last_knee_acc: float | None = None
         self._last_hv_pr: float | None = None
         self._last_val_n_nd: int | None = None
-        self._last_wandb_step: int | None = None
+        self._last_wandb_n_eval: int | None = None
         self._validated_this_step: bool = False
 
     def collect_train_metrics(self, algorithm) -> dict[str, float | int]:
@@ -174,8 +179,10 @@ class StepOutput(Output):
         if F_opt is None or len(F_opt) == 0:
             return {}
         F_opt = np.asarray(F_opt, dtype=float)
+        opt_step = to_wandb_step(algorithm.n_gen, self.max_steps)
         metrics: dict[str, float | int] = {
             "train/n_eval": int(n_eval) if n_eval is not None else 0,
+            "train/step": int(opt_step),
             "train/n_nds": len(F_opt),
             "train/hv": float(self._last_hv),
         }
@@ -189,10 +196,17 @@ class StepOutput(Output):
             metrics["train/pf_recall_max"] = float(np.max(recall))
             metrics["train/pf_pr_mean_min"] = float(np.min(pr_mean))
             metrics["train/pf_pr_mean_max"] = float(np.max(pr_mean))
+            # Shared with CMA: train knee (closest to P=R=1) as scalar report.
+            knee_i = int(np.argmin(np.sum(np.square(F_opt[:, :2]), axis=1)))
+            metrics["train/precision"] = float(precision[knee_i])
+            metrics["train/recall"] = float(recall[knee_i])
+            metrics["train/f"] = float(F_opt[knee_i, 0] + F_opt[knee_i, 1])
+            metrics["train/mean_f"] = float(metrics["train/f"])
         else:
             per_ind = np.mean(F_opt, axis=1)
             metrics["train/mean_f"] = float(np.mean(per_ind))
             metrics["train/min_f"] = float(np.min(per_ind))
+            metrics["train/f"] = float(metrics["train/min_f"])
         return metrics
 
     def collect_val_metrics(self) -> dict[str, float | int]:
@@ -207,17 +221,25 @@ class StepOutput(Output):
         if self.is_precision_recall:
             if self._last_knee_prec is not None:
                 metrics["val/knee_precision"] = float(self._last_knee_prec)
+                metrics["val/precision"] = float(self._last_knee_prec)
             if self._last_knee_rec is not None:
                 metrics["val/knee_recall"] = float(self._last_knee_rec)
+                metrics["val/recall"] = float(self._last_knee_rec)
             if self._last_knee_pr_mean is not None:
                 metrics["val/knee_pr_mean"] = float(self._last_knee_pr_mean)
             if self._last_knee_f1 is not None:
                 metrics["val/knee_f1"] = float(self._last_knee_f1)
+                metrics["val/f1"] = float(self._last_knee_f1)
             if self._last_knee_acc is not None:
                 metrics["val/knee_acc"] = float(self._last_knee_acc)
+                metrics["val/acc"] = float(self._last_knee_acc)
             if self._last_hv_pr is not None:
                 metrics["val/hv_pr"] = float(self._last_hv_pr)
         else:
+            # Shared names: report best-acc individual (same as acc_best).
+            metrics["val/acc"] = float(self._last_best_acc)
+            if self._last_best_f1 is not None:
+                metrics["val/f1"] = float(self._last_best_f1)
             if self._last_val_acc is not None:
                 metrics["val/mean_acc"] = float(self._last_val_acc)
             if self._last_val_f1 is not None:
@@ -258,12 +280,18 @@ class StepOutput(Output):
     ) -> None:
         if not self.use_wandb:
             return
-        step = (
-            to_wandb_step(algorithm.n_gen, self.max_steps)
-            if wandb_step is None
-            else min(int(wandb_step), self.max_steps or int(wandb_step))
-        )
-        if not force and self._last_wandb_step == step:
+        n_eval = getattr(getattr(algorithm, "evaluator", None), "n_eval", None)
+        if n_eval is None:
+            # Fallback if evaluator missing: approximate from opt step * popsize.
+            opt_step = (
+                to_wandb_step(algorithm.n_gen, self.max_steps)
+                if wandb_step is None
+                else int(wandb_step)
+            )
+            pop_size = len(algorithm.pop) if getattr(algorithm, "pop", None) is not None else 0
+            n_eval = max(0, opt_step) * max(pop_size, 1)
+        n_eval = int(n_eval)
+        if not force and self._last_wandb_n_eval == n_eval:
             return
 
         metrics = self.collect_train_metrics(algorithm)
@@ -272,15 +300,16 @@ class StepOutput(Output):
         # Only emit val/* on steps where validation actually ran.
         if include_val if include_val is not None else self._validated_this_step:
             metrics.update(self.collect_val_metrics())
-        log_metrics(metrics, step=step)
-        self._last_wandb_step = step
+        log_metrics(metrics, n_eval=n_eval)
+        self._last_wandb_n_eval = n_eval
         self._validated_this_step = False
 
     def _maybe_save_train_pareto(self, algorithm, *, step: int) -> None:
-        """Append train precision–recall ND front to local ``history.npz``."""
-        if self.pareto_history is None or not self.is_precision_recall:
+        """Append train precision–recall ND front to ``train_history.npz``."""
+        if self.train_history is None or not self.is_precision_recall:
             return
-        if step <= 0 or step % self.pareto_every != 0:
+        # Snapshot at step 1, then every pareto_every.
+        if step <= 0 or (step != 1 and step % self.pareto_every != 0):
             return
         F = algorithm.opt.get("F")
         if F is None or len(F) == 0:
@@ -290,7 +319,7 @@ class StepOutput(Output):
             return
         precision = 1.0 - F[:, 0]
         recall = 1.0 - F[:, 1]
-        self.pareto_history.append(step, precision, recall)
+        self.train_history.append(step, precision, recall)
 
     def _sync_batch_window(self, algorithm) -> None:
         problem = algorithm.problem
@@ -380,6 +409,22 @@ class StepOutput(Output):
             self._last_knee_f1 = knee["f1"]
             self._last_knee_acc = knee["acc"]
             self._last_hv_pr = hv_pr
+            if self.val_history is not None:
+                self.val_history.append(
+                    step,
+                    result.macro_precision,
+                    result.macro_recall,
+                    scalars={
+                        "acc_best": float(result.best_acc),
+                        "f1_best": float(result.best_f1),
+                        "knee_precision": float(knee["precision"]),
+                        "knee_recall": float(knee["recall"]),
+                        "knee_pr_mean": float(knee["pr_mean"]),
+                        "knee_f1": float(knee["f1"]),
+                        "knee_acc": float(knee["acc"]),
+                        "hv_pr": float(hv_pr),
+                    },
+                )
             print(
                 f"[step {step}] test ND (n={len(X)}): "
                 f"acc_best={result.best_acc:.4f}  f1_best={result.best_f1:.4f}  "

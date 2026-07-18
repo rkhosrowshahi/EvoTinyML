@@ -1,24 +1,42 @@
-"""Local on-disk history of train Pareto fronts."""
+"""Local on-disk history of train / val Pareto fronts."""
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
 
-class ParetoFrontHistory:
-    """Append train P–R fronts and rewrite ``history.npz`` on each snapshot."""
+class FrontHistory:
+    """Append P–R fronts and rewrite an NPZ on each snapshot."""
 
-    def __init__(self, path: str | Path = "history.npz") -> None:
+    def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.steps: list[int] = []
         self.n_nds: list[int] = []
         self._F_chunks: list[np.ndarray] = []
         self._precision_chunks: list[np.ndarray] = []
         self._recall_chunks: list[np.ndarray] = []
+        self._scalar_keys: list[str] = []
+        self._scalars: dict[str, list[float]] = {}
 
-    def append(self, step: int, precision: np.ndarray, recall: np.ndarray) -> None:
+    def _pop_last(self) -> None:
+        self.steps.pop()
+        self.n_nds.pop()
+        self._F_chunks.pop()
+        self._precision_chunks.pop()
+        self._recall_chunks.pop()
+        for key in self._scalar_keys:
+            self._scalars[key].pop()
+
+    def append(
+        self,
+        step: int,
+        precision: np.ndarray,
+        recall: np.ndarray,
+        scalars: dict[str, float] | None = None,
+    ) -> None:
         p = np.asarray(precision, dtype=np.float64).ravel()
         r = np.asarray(recall, dtype=np.float64).ravel()
         if p.size == 0 or p.size != r.size:
@@ -29,11 +47,16 @@ class ParetoFrontHistory:
 
         # Replace snapshot if the same step is written twice (e.g. end-of-run).
         if self.steps and self.steps[-1] == int(step):
-            self.steps.pop()
-            self.n_nds.pop()
-            self._F_chunks.pop()
-            self._precision_chunks.pop()
-            self._recall_chunks.pop()
+            self._pop_last()
+
+        if scalars:
+            if not self._scalar_keys:
+                self._scalar_keys = sorted(scalars.keys())
+                self._scalars = {k: [] for k in self._scalar_keys}
+            for key in self._scalar_keys:
+                if key not in scalars:
+                    raise ValueError(f"Missing scalar {key!r} for history snapshot")
+                self._scalars[key].append(float(scalars[key]))
 
         self.steps.append(int(step))
         self.n_nds.append(int(p.size))
@@ -44,21 +67,27 @@ class ParetoFrontHistory:
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.steps:
-            np.savez_compressed(
-                self.path,
-                steps=np.zeros(0, dtype=np.int64),
-                n_nds=np.zeros(0, dtype=np.int64),
-                F=np.zeros((0, 2), dtype=np.float64),
-                precision=np.zeros(0, dtype=np.float64),
-                recall=np.zeros(0, dtype=np.float64),
-            )
-            return
-        np.savez_compressed(
-            self.path,
-            steps=np.asarray(self.steps, dtype=np.int64),
-            n_nds=np.asarray(self.n_nds, dtype=np.int64),
-            F=np.concatenate(self._F_chunks, axis=0),
-            precision=np.concatenate(self._precision_chunks, axis=0),
-            recall=np.concatenate(self._recall_chunks, axis=0),
-        )
+        payload: dict[str, Any] = {
+            "steps": np.asarray(self.steps, dtype=np.int64)
+            if self.steps
+            else np.zeros(0, dtype=np.int64),
+            "n_nds": np.asarray(self.n_nds, dtype=np.int64)
+            if self.n_nds
+            else np.zeros(0, dtype=np.int64),
+            "F": np.concatenate(self._F_chunks, axis=0)
+            if self._F_chunks
+            else np.zeros((0, 2), dtype=np.float64),
+            "precision": np.concatenate(self._precision_chunks, axis=0)
+            if self._precision_chunks
+            else np.zeros(0, dtype=np.float64),
+            "recall": np.concatenate(self._recall_chunks, axis=0)
+            if self._recall_chunks
+            else np.zeros(0, dtype=np.float64),
+        }
+        for key in self._scalar_keys:
+            payload[key] = np.asarray(self._scalars[key], dtype=np.float64)
+        np.savez_compressed(self.path, **payload)
+
+
+# Backward-compatible alias.
+ParetoFrontHistory = FrontHistory

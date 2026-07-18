@@ -18,7 +18,9 @@ from evotinyml.crossover import NoCrossover
 from evotinyml.mutation import AbsoluteGaussianMutation, LayerWiseGaussianMutation
 
 
-ALGORITHMS = ("nsga2", "nsga3")
+MOO_ALGORITHMS = ("nsga2", "nsga3")
+SOO_ALGORITHMS = ("cmaes",)
+ALGORITHMS = MOO_ALGORITHMS + SOO_ALGORITHMS
 CROSSOVERS = ("sbx", "none")
 MUTATIONS = ("pm", "gaussian", "layerwise")
 
@@ -206,4 +208,4 @@ def build_algorithm(
         }
         return algo
 
-    raise ValueError(f"Unknown algorithm: {name!r}. Use one of {ALGORITHMS}.")
+    raise ValueError(f"Unknown algorithm: {name!r}. Use one of {MOO_ALGORITHMS}.")
