@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.env
+
+# Data & artifacts
+data/
+*.npz
+history.npz
+wandb/
+runs/
+outputs/
+checkpoints/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
