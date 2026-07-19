@@ -26,8 +26,10 @@ PROBLEMS = (
 )
 # Problems that expose a 2-obj (1-P, 1-R) front in train/display/W&B.
 PR_PROBLEMS = frozenset({"precision_recall", "soft_precision_recall"})
-# Scalar problems accepted by CMA-ES.
-CMA_PROBLEMS = frozenset({"soft_precision_recall", "erm_cross_entropy"})
+# Cross-entropy problems that log per-class acc / CE.
+CE_PROBLEMS = frozenset({"cwrm_cross_entropy", "erm_cross_entropy"})
+# Scalar problems accepted by SOO ES (cmaes / snes / xnes / open_es).
+SOO_PROBLEMS = frozenset({"soft_precision_recall", "erm_cross_entropy"})
 # SOO-only (reject NSGA).
 SOO_ONLY_PROBLEMS = frozenset({"erm_cross_entropy"})
 # Backward-compatible CLI aliases → canonical problem name.
@@ -81,6 +83,10 @@ class WeightOptimizationProblem(Problem):
 
         self._param_shapes = [tuple(p.shape) for p in self.model.parameters()]
         self._n_var = sum(p.numel() for p in self.model.parameters())
+        # Snapshot of PyTorch default weights at construction (before any set_weights).
+        self.theta0 = np.concatenate(
+            [p.detach().cpu().numpy().ravel() for p in self.model.parameters()]
+        ).astype(np.float64)
 
         # Cached pool of eval batches shared by the whole population.
         self.eval_batch_pool: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -296,8 +302,8 @@ class SoftPrecisionRecallProblem(WeightOptimizationProblem):
 class ERMCrossEntropyProblem(WeightOptimizationProblem):
     """Empirical risk minimization with mean cross-entropy (ERM–CE).
 
-    Single-objective mean CE on the eval batch pool. Intended for CMA-ES
-    (``--algo cmaes``). Not for NSGA multi-objective runs.
+    Single-objective mean CE on the eval batch pool. Intended for SOO ES
+    (``--algo cmaes`` / ``snes`` / ``xnes`` / ``open_es``). Not for NSGA.
     """
 
     def __init__(

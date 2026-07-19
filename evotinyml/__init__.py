@@ -1,3 +1,3 @@
-"""EvoTinyML: NSGA-II multi-objective training of tiny CNNs."""
+"""EvoTinyML: evolutionary training of tiny CNNs (MOO + SOO)."""
 
 __version__ = "0.1.0"

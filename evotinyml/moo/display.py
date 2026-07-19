@@ -9,10 +9,25 @@ from pymoo.util.display.output import Output
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 from torch.utils.data import DataLoader
 
-from evotinyml.pareto_history import FrontHistory
-from evotinyml.problem import PR_PROBLEMS, WeightOptimizationProblem
-from evotinyml.validation import validate_nd_set
+from evotinyml.moo.pareto_history import FrontHistory
+from evotinyml.moo.pareto_plot import pareto_front_images
+from evotinyml.problem import CE_PROBLEMS, PR_PROBLEMS, WeightOptimizationProblem
+from evotinyml.validation import (
+    class_metric_log_dict,
+    per_class_acc_ce_on_eval_pool,
+    validate_nd_set,
+)
 from evotinyml.wandb_logger import log_metrics, to_wandb_step
+
+
+def _knee_index_utopia(F: np.ndarray) -> int:
+    """Index closest to the origin in L2 (utopia for minimization objectives)."""
+    F = np.asarray(F, dtype=float)
+    if F.ndim == 1:
+        return 0
+    if len(F) == 0:
+        return 0
+    return int(np.argmin(np.sum(np.square(F), axis=1)))
 
 
 def _normalize_by_nadir(F: np.ndarray, nadir: np.ndarray) -> np.ndarray:
@@ -89,6 +104,7 @@ class StepOutput(Output):
         super().__init__()
         self.problem_name = problem_name
         self.is_precision_recall = problem_name in PR_PROBLEMS
+        self.is_ce_problem = problem_name in CE_PROBLEMS
         self.use_wandb = use_wandb
         self.max_steps = int(max_steps) if max_steps is not None else None
         self.pareto_every = max(1, int(pareto_every))
@@ -172,6 +188,9 @@ class StepOutput(Output):
         self._last_val_n_nd: int | None = None
         self._last_wandb_n_eval: int | None = None
         self._validated_this_step: bool = False
+        self._last_class_train: dict[str, float] = {}
+        self._last_class_val: dict[str, float] = {}
+        self._pending_pareto_images: dict = {}
 
     def collect_train_metrics(self, algorithm) -> dict[str, float | int]:
         n_eval = getattr(getattr(algorithm, "evaluator", None), "n_eval", None)
@@ -196,7 +215,7 @@ class StepOutput(Output):
             metrics["train/pf_recall_max"] = float(np.max(recall))
             metrics["train/pf_pr_mean_min"] = float(np.min(pr_mean))
             metrics["train/pf_pr_mean_max"] = float(np.max(pr_mean))
-            # Shared with CMA: train knee (closest to P=R=1) as scalar report.
+            # Shared with SOO: train knee (closest to P=R=1) as scalar report.
             knee_i = int(np.argmin(np.sum(np.square(F_opt[:, :2]), axis=1)))
             metrics["train/precision"] = float(precision[knee_i])
             metrics["train/recall"] = float(recall[knee_i])
@@ -206,7 +225,21 @@ class StepOutput(Output):
             per_ind = np.mean(F_opt, axis=1)
             metrics["train/mean_f"] = float(np.mean(per_ind))
             metrics["train/min_f"] = float(np.min(per_ind))
-            metrics["train/f"] = float(metrics["train/min_f"])
+            # CWRM: knee = closest to utopia (all CE=0) in L2.
+            knee_i = _knee_index_utopia(F_opt)
+            metrics["train/f"] = float(per_ind[knee_i])
+            metrics["train/knee_f"] = float(per_ind[knee_i])
+            if self.is_ce_problem:
+                X_opt = algorithm.opt.get("X")
+                problem = algorithm.problem
+                if (
+                    X_opt is not None
+                    and len(X_opt) > knee_i
+                    and isinstance(problem, WeightOptimizationProblem)
+                ):
+                    acc_c, ce_c = per_class_acc_ce_on_eval_pool(problem, X_opt[knee_i])
+                    self._last_class_train = class_metric_log_dict("train", acc_c, ce_c)
+                    metrics.update(self._last_class_train)
         return metrics
 
     def collect_val_metrics(self) -> dict[str, float | int]:
@@ -236,9 +269,16 @@ class StepOutput(Output):
             if self._last_hv_pr is not None:
                 metrics["val/hv_pr"] = float(self._last_hv_pr)
         else:
-            # Shared names: report best-acc individual (same as acc_best).
-            metrics["val/acc"] = float(self._last_best_acc)
-            if self._last_best_f1 is not None:
+            # CWRM / other: shared val/acc is the knee individual (not best-acc).
+            if self._last_knee_acc is not None:
+                metrics["val/acc"] = float(self._last_knee_acc)
+                metrics["val/knee_acc"] = float(self._last_knee_acc)
+            else:
+                metrics["val/acc"] = float(self._last_best_acc)
+            if self._last_knee_f1 is not None:
+                metrics["val/f1"] = float(self._last_knee_f1)
+                metrics["val/knee_f1"] = float(self._last_knee_f1)
+            elif self._last_best_f1 is not None:
                 metrics["val/f1"] = float(self._last_best_f1)
             if self._last_val_acc is not None:
                 metrics["val/mean_acc"] = float(self._last_val_acc)
@@ -248,6 +288,7 @@ class StepOutput(Output):
                 metrics["val/hv_acc"] = float(self._last_hv_acc)
             if self._last_hv_f1 is not None:
                 metrics["val/hv_f1"] = float(self._last_hv_f1)
+            metrics.update(self._last_class_val)
         return metrics
 
     def final_summary_metrics(self) -> dict[str, float | int]:
@@ -268,6 +309,10 @@ class StepOutput(Output):
                 out["final/knee_f1"] = float(self._last_knee_f1)
             if self._last_knee_acc is not None:
                 out["final/knee_acc"] = float(self._last_knee_acc)
+        elif self._last_knee_acc is not None:
+            out["final/knee_acc"] = float(self._last_knee_acc)
+            if self._last_knee_f1 is not None:
+                out["final/knee_f1"] = float(self._last_knee_f1)
         return out
 
     def log_wandb(
@@ -295,19 +340,20 @@ class StepOutput(Output):
             return
 
         metrics = self.collect_train_metrics(algorithm)
-        if not metrics:
+        if not metrics and not self._pending_pareto_images:
             return
         # Only emit val/* on steps where validation actually ran.
         if include_val if include_val is not None else self._validated_this_step:
             metrics.update(self.collect_val_metrics())
+        if self._pending_pareto_images:
+            metrics.update(self._pending_pareto_images)
+            self._pending_pareto_images = {}
         log_metrics(metrics, n_eval=n_eval)
         self._last_wandb_n_eval = n_eval
         self._validated_this_step = False
 
     def _maybe_save_train_pareto(self, algorithm, *, step: int) -> None:
-        """Append train precision–recall ND front to ``train_history.npz``."""
-        if self.train_history is None or not self.is_precision_recall:
-            return
+        """Persist P–R front history and queue a W&B Pareto plot."""
         # Snapshot at step 1, then every pareto_every.
         if step <= 0 or (step != 1 and step % self.pareto_every != 0):
             return
@@ -317,9 +363,30 @@ class StepOutput(Output):
         F = np.asarray(F, dtype=float)
         if F.ndim != 2 or F.shape[1] < 2:
             return
-        precision = 1.0 - F[:, 0]
-        recall = 1.0 - F[:, 1]
-        self.train_history.append(step, precision, recall)
+
+        history = None
+        if self.is_precision_recall and self.train_history is not None:
+            precision = 1.0 - F[:, 0]
+            recall = 1.0 - F[:, 1]
+            self.train_history.append(step, precision, recall)
+            history = self.train_history.iter_fronts()
+
+        if self.use_wandb:
+            labels = (
+                [f"c{j}" for j in range(F.shape[1])]
+                if self.is_ce_problem
+                else None
+            )
+            self._pending_pareto_images.update(
+                pareto_front_images(
+                    F,
+                    problem_name=self.problem_name,
+                    step=step,
+                    key_prefix="train",
+                    history=history,
+                    obj_labels=labels,
+                )
+            )
 
     def _sync_batch_window(self, algorithm) -> None:
         problem = algorithm.problem
@@ -425,6 +492,20 @@ class StepOutput(Output):
                         "hv_pr": float(hv_pr),
                     },
                 )
+            if self.use_wandb:
+                self._pending_pareto_images.update(
+                    pareto_front_images(
+                        result.error_pr,
+                        problem_name=self.problem_name,
+                        step=step,
+                        key_prefix="val",
+                        history=(
+                            self.val_history.iter_fronts()
+                            if self.val_history is not None
+                            else None
+                        ),
+                    )
+                )
             print(
                 f"[step {step}] test ND (n={len(X)}): "
                 f"acc_best={result.best_acc:.4f}  f1_best={result.best_f1:.4f}  "
@@ -451,9 +532,32 @@ class StepOutput(Output):
             self._last_val_f1 = result.mean_f1
             self._last_hv_acc = hv_acc
             self._last_hv_f1 = hv_f1
+            # Knee on test class-wise CE (closest to utopia CE=0).
+            knee_i = _knee_index_utopia(result.per_class_ce)
+            self._last_knee_acc = float(result.overall_acc[knee_i])
+            self._last_knee_f1 = float(result.macro_f1[knee_i])
+            if self.is_ce_problem:
+                self._last_class_val = class_metric_log_dict(
+                    "val",
+                    result.per_class_acc[knee_i],
+                    result.per_class_ce[knee_i],
+                )
+            if self.use_wandb and self.is_ce_problem:
+                # Log val radar on the same cadence as train Pareto plots.
+                if step == 1 or step % self.pareto_every == 0:
+                    self._pending_pareto_images.update(
+                        pareto_front_images(
+                            result.per_class_ce,
+                            problem_name=self.problem_name,
+                            step=step,
+                            key_prefix="val",
+                            obj_labels=[f"c{j}" for j in range(result.per_class_ce.shape[1])],
+                        )
+                    )
             print(
                 f"[step {step}] test ND (n={len(X)}): "
                 f"acc_best={result.best_acc:.4f}  f1_best={result.best_f1:.4f}  "
+                f"knee_acc={self._last_knee_acc:.4f}  knee_f1={self._last_knee_f1:.4f}  "
                 f"mean_acc={result.mean_acc:.4f}  mean_f1={result.mean_f1:.4f}  "
                 f"HV_acc={hv_acc:.6f}  HV_F1={hv_f1:.6f}"
             )

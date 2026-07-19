@@ -62,8 +62,10 @@ def build_model(
     activation: str = "relu",
 ) -> TinyCNN:
     dataset = dataset.lower()
-    if dataset == "mnist":
+    if dataset in {"mnist", "mnist_2cls"}:
         return TinyCNN(in_channels=1, num_classes=num_classes, activation=activation)
     if dataset == "cifar10":
         return TinyCNN(in_channels=3, num_classes=num_classes, activation=activation)
-    raise ValueError(f"Unsupported dataset: {dataset!r}. Use 'mnist' or 'cifar10'.")
+    raise ValueError(
+        f"Unsupported dataset: {dataset!r}. Use 'mnist', 'mnist_2cls', or 'cifar10'."
+    )

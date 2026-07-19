@@ -6,7 +6,7 @@ from typing import Any
 
 import wandb
 
-from evotinyml.algorithms import OperatorConfig
+from evotinyml.moo.algorithms import OperatorConfig
 
 
 DEFAULT_ENTITY = "rasa_research"

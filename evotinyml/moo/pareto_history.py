@@ -65,6 +65,13 @@ class FrontHistory:
         self._recall_chunks.append(r)
         self.save()
 
+    def iter_fronts(self) -> list[tuple[int, np.ndarray, np.ndarray]]:
+        """Return ``(step, precision, recall)`` snapshots in chronological order."""
+        return [
+            (int(s), p.copy(), r.copy())
+            for s, p, r in zip(self.steps, self._precision_chunks, self._recall_chunks)
+        ]
+
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload: dict[str, Any] = {

@@ -14,13 +14,11 @@ from pymoo.operators.mutation.pm import PM
 from pymoo.util.display.output import Output
 from pymoo.util.ref_dirs import get_reference_directions
 
-from evotinyml.crossover import NoCrossover
-from evotinyml.mutation import AbsoluteGaussianMutation, LayerWiseGaussianMutation
+from evotinyml.moo.crossover import NoCrossover
+from evotinyml.moo.mutation import AbsoluteGaussianMutation, LayerWiseGaussianMutation
 
 
 MOO_ALGORITHMS = ("nsga2", "nsga3")
-SOO_ALGORITHMS = ("cmaes",)
-ALGORITHMS = MOO_ALGORITHMS + SOO_ALGORITHMS
 CROSSOVERS = ("sbx", "none")
 MUTATIONS = ("pm", "gaussian", "layerwise")
 

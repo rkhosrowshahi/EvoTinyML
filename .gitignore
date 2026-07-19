@@ -17,6 +17,7 @@ wandb/
 runs/
 outputs/
 checkpoints/
+results/
 
 # OS / IDE
 .DS_Store

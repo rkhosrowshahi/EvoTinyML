@@ -8,21 +8,42 @@ from torch.utils.data import Dataset, Subset
 from torchvision import datasets, transforms
 
 
-def load_dataset(name: str, root: str = "./data", train: bool = True) -> Dataset:
-    """Load MNIST or CIFAR-10 with a simple ToTensor transform."""
+DATASETS = ("mnist", "mnist_2cls", "cifar10")
+
+
+def _filter_labels(dataset: Dataset, keep_labels: tuple[int, ...]) -> Subset:
+    """Keep only samples whose label is in ``keep_labels`` (labels unchanged)."""
+    labels = _labels_of(dataset)
+    keep = set(int(c) for c in keep_labels)
+    indices = np.flatnonzero(np.isin(labels, list(keep))).tolist()
+    if not indices:
+        raise ValueError(f"No samples found for labels {sorted(keep)}.")
+    return Subset(dataset, indices)
+
+
+def load_dataset(name: str, root: str = "./data", train: bool = True) -> tuple[Dataset, int]:
+    """Load a supported image dataset with a simple ToTensor transform.
+
+    Returns ``(dataset, num_classes)``. ``mnist_2cls`` keeps digits {0, 1}
+    (labels already in ``{0, 1}``), so CWRM / class-balanced sampling use
+    ``n_obj = num_classes = 2``.
+    """
     name = name.lower()
     transform = transforms.ToTensor()
-    num_classes = 10
-    dataset = None
     if name == "mnist":
-        dataset = datasets.MNIST(root=root, train=train, download=True, transform=transform)
-        num_classes = 10
-    elif name == "cifar10":
-        dataset = datasets.CIFAR10(root=root, train=train, download=True, transform=transform)
-        num_classes = 10
-    else:
-        raise ValueError(f"Unsupported dataset: {name!r}. Use 'mnist' or 'cifar10'.")
-    return dataset, num_classes
+        dataset: Dataset = datasets.MNIST(
+            root=root, train=train, download=True, transform=transform
+        )
+        return dataset, 10
+    if name == "mnist_2cls":
+        full = datasets.MNIST(root=root, train=train, download=True, transform=transform)
+        return _filter_labels(full, (0, 1)), 2
+    if name == "cifar10":
+        dataset = datasets.CIFAR10(
+            root=root, train=train, download=True, transform=transform
+        )
+        return dataset, 10
+    raise ValueError(f"Unsupported dataset: {name!r}. Use one of {DATASETS}.")
 
 
 def _labels_of(dataset: Dataset) -> np.ndarray:

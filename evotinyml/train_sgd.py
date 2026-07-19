@@ -17,9 +17,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train TinyCNN with SGD (lr=0.1).")
     parser.add_argument(
         "--dataset",
-        choices=("mnist", "cifar10"),
+        choices=("mnist", "mnist_2cls", "cifar10"),
         required=True,
-        help="Dataset to train on.",
+        help="Dataset: mnist (10-class), mnist_2cls (digits 0/1), or cifar10.",
     )
     parser.add_argument(
         "--activation",
