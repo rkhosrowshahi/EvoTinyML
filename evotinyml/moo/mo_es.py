@@ -32,7 +32,11 @@ from torch.utils.data import DataLoader
 
 from evotinyml.moo.algorithms import make_reference_directions
 from evotinyml.moo.display import _hv_unit_front, _normalize_by_nadir
-from evotinyml.moo.pareto_plot import pareto_front_images
+from evotinyml.moo.pareto_plot import (
+    class_obj_labels,
+    pareto_front_images,
+    val_class_pareto_images,
+)
 from evotinyml.problem import CE_PROBLEMS, WeightOptimizationProblem
 from evotinyml.soo.es import (
     DEFAULT_ES_OPTIM,
@@ -456,7 +460,7 @@ class _RunLogger:
                 step == 0 or step == 1 or step % self.pareto_every == 0
             ):
                 labels = (
-                    [f"c{j}" for j in range(self.archive.F.shape[1])]
+                    class_obj_labels(self.archive.F.shape[1])
                     if getattr(self.problem, "problem_name", "") in CE_PROBLEMS
                     else None
                 )
@@ -538,14 +542,10 @@ class _RunLogger:
                 force or step == 1 or step % self.pareto_every == 0
             ):
                 metrics.update(
-                    pareto_front_images(
+                    val_class_pareto_images(
                         result.per_class_ce,
-                        problem_name=getattr(self.problem, "problem_name", ""),
+                        result.per_class_acc,
                         step=step,
-                        key_prefix="val",
-                        obj_labels=[
-                            f"c{j}" for j in range(result.per_class_ce.shape[1])
-                        ],
                     )
                 )
 

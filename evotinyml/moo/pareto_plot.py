@@ -16,6 +16,11 @@ from matplotlib.figure import Figure
 from evotinyml.problem import PR_PROBLEMS
 
 
+def class_obj_labels(n_obj: int) -> list[str]:
+    """Axis labels for class-wise objectives: ``Class 0``, ``Class 1``, …"""
+    return [f"Class {i}" for i in range(int(n_obj))]
+
+
 def _knee_index_minimize(F: np.ndarray) -> int:
     F = np.asarray(F, dtype=float)
     if len(F) == 0:
@@ -174,11 +179,12 @@ def figure_radar_front(
     labels: Sequence[str] | None = None,
     directions: Sequence[str] | None = None,
     title_prefix: str = "Train",
+    title: str | None = None,
     highlight: np.ndarray | None = None,
     highlight_label: str = "center",
     max_n: int = 40,
 ) -> Figure:
-    """Radar chart for n_obj > 2 (outer = better after per-axis normalization)."""
+    """Radar chart (outer = better after per-axis normalization)."""
     F = np.asarray(F, dtype=float)
     if F.ndim != 2 or F.shape[1] < 2:
         raise ValueError(f"Expected F with shape (n, >=2), got {F.shape}")
@@ -227,11 +233,12 @@ def figure_radar_front(
     ax.set_yticks([0.25, 0.5, 0.75, 1.0])
     ax.set_yticklabels(["0.25", "0.50", "0.75", "best"], fontsize=8, color="grey")
     ax.set_ylim(0, 1)
-    ax.set_title(
-        f"{title_prefix} Pareto radar (step {int(step)}; outer=better)",
-        fontsize=13,
-        pad=22,
+    plot_title = (
+        f"{title} (step {int(step)}; outer=better)"
+        if title is not None
+        else f"{title_prefix} Pareto radar (step {int(step)}; outer=better)"
     )
+    ax.set_title(plot_title, fontsize=13, pad=22)
     sm = cm.ScalarMappable(cmap=cmap, norm=cnorm)
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=ax, pad=0.1, shrink=0.72)
@@ -247,6 +254,7 @@ def figure_parallel_front(
     labels: Sequence[str] | None = None,
     directions: Sequence[str] | None = None,
     title_prefix: str = "Train",
+    title: str | None = None,
     highlight: np.ndarray | None = None,
     highlight_label: str = "center",
     max_n: int = 40,
@@ -299,10 +307,12 @@ def figure_parallel_front(
     ax.set_xlim(-0.2, n_obj - 0.8)
     ax.set_ylim(-0.02, 1.02)
     ax.set_ylabel("goodness (1 = best on axis)")
-    ax.set_title(
-        f"{title_prefix} Pareto parallel coords (step {int(step)}; top=better)",
-        fontsize=13,
+    plot_title = (
+        f"{title} (step {int(step)}; top=better)"
+        if title is not None
+        else f"{title_prefix} Pareto parallel coords (step {int(step)}; top=better)"
     )
+    ax.set_title(plot_title, fontsize=13)
     ax.grid(True, axis="y", alpha=0.35)
     sm = cm.ScalarMappable(cmap=cmap, norm=cnorm)
     sm.set_array([])
@@ -319,6 +329,91 @@ def figure_to_wandb_image(fig: Figure):
     image = wandb.Image(fig)
     plt.close(fig)
     return image
+
+
+def _radar_parallel_images(
+    F: np.ndarray,
+    *,
+    step: int,
+    key_prefix: str,
+    key_tag: str,
+    title: str,
+    directions: Sequence[str],
+    obj_labels: Sequence[str] | None = None,
+    highlight: np.ndarray | None = None,
+    highlight_label: str = "center",
+) -> dict[str, Any]:
+    """Radar + parallel images for a class-wise front."""
+    F = np.asarray(F, dtype=float)
+    if F.ndim != 2 or len(F) == 0 or F.shape[1] < 2:
+        return {}
+    labels = list(obj_labels) if obj_labels is not None else class_obj_labels(F.shape[1])
+    radar = figure_radar_front(
+        F,
+        step=step,
+        labels=labels,
+        directions=directions,
+        title=title,
+        highlight=highlight,
+        highlight_label=highlight_label,
+    )
+    parallel = figure_parallel_front(
+        F,
+        step=step,
+        labels=labels,
+        directions=directions,
+        title=title,
+        highlight=highlight,
+        highlight_label=highlight_label,
+    )
+    return {
+        f"{key_prefix}/pareto_radar_{key_tag}": figure_to_wandb_image(radar),
+        f"{key_prefix}/pareto_parallel_{key_tag}": figure_to_wandb_image(parallel),
+    }
+
+
+def val_class_pareto_images(
+    per_class_ce: np.ndarray,
+    per_class_acc: np.ndarray,
+    *,
+    step: int,
+    key_prefix: str = "val",
+) -> dict[str, Any]:
+    """Val Pareto plots for class-wise CE (min) and accuracy (max).
+
+    Logs radar + parallel under:
+      ``{prefix}/pareto_{radar|parallel}_ce``
+      ``{prefix}/pareto_{radar|parallel}_acc``
+    with titles ``Val Cross-entropy Pareto Front`` / ``Val Accuracy Pareto Front``.
+    """
+    out: dict[str, Any] = {}
+    ce = np.asarray(per_class_ce, dtype=float)
+    acc = np.asarray(per_class_acc, dtype=float)
+    if ce.ndim == 2 and ce.shape[1] >= 2 and len(ce) > 0:
+        out.update(
+            _radar_parallel_images(
+                ce,
+                step=step,
+                key_prefix=key_prefix,
+                key_tag="ce",
+                title="Val Cross-entropy Pareto Front",
+                directions=["min"] * ce.shape[1],
+                obj_labels=class_obj_labels(ce.shape[1]),
+            )
+        )
+    if acc.ndim == 2 and acc.shape[1] >= 2 and len(acc) > 0:
+        out.update(
+            _radar_parallel_images(
+                acc,
+                step=step,
+                key_prefix=key_prefix,
+                key_tag="acc",
+                title="Val Accuracy Pareto Front",
+                directions=["max"] * acc.shape[1],
+                obj_labels=class_obj_labels(acc.shape[1]),
+            )
+        )
+    return out
 
 
 def pareto_front_images(
@@ -368,7 +463,7 @@ def pareto_front_images(
     labels = (
         list(obj_labels)
         if obj_labels is not None
-        else [f"c{j}" for j in range(F.shape[1])]
+        else class_obj_labels(F.shape[1])
     )
     directions = ["min"] * F.shape[1]
     title = key_prefix.capitalize()

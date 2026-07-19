@@ -138,7 +138,7 @@ def load_front(path: Path, *, use_acc: bool) -> tuple[np.ndarray, np.ndarray | N
         directions = ["min"] * front.shape[1]
         kind = "class-wise CE"
 
-    labels = [f"c{j}" for j in range(front.shape[1])]
+    labels = [f"Class {j}" for j in range(front.shape[1])]
     print(f"Loaded {len(front)} solutions × {front.shape[1]} objs ({kind}) from {path}")
     return front, highlight, labels, directions
 

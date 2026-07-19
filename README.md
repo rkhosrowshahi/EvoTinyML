@@ -139,8 +139,9 @@ python3 train.py --dataset mnist --problem soft_precision_recall --algo nsga2 --
 - Shared val keys for overlays: `val/acc`, `val/f1`, `val/knee_acc`, `val/acc_best`, …
 - MOO also logs HV / front extremes; SOO ES logs `train/f` (mean fitness) and `train/step`
 - MOO Pareto plots (every `--pareto-every`): P–R → `train/pareto_front` /
-  `val/pareto_front` (scatter); CWRM / high-dim → `*/pareto_radar` and
-  `*/pareto_parallel`
+  `val/pareto_front` (scatter); CWRM → train `*/pareto_radar` + `*/pareto_parallel`;
+  val also logs CE and Acc fronts (`val/pareto_{radar|parallel}_{ce|acc}`)
+  titled **Val Cross-entropy Pareto Front** / **Val Accuracy Pareto Front**
 
 Compare NSGA vs a SOO ES run locally (script flag is still `--cma`):
 

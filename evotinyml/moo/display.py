@@ -10,7 +10,11 @@ from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 from torch.utils.data import DataLoader
 
 from evotinyml.moo.pareto_history import FrontHistory
-from evotinyml.moo.pareto_plot import pareto_front_images
+from evotinyml.moo.pareto_plot import (
+    class_obj_labels,
+    pareto_front_images,
+    val_class_pareto_images,
+)
 from evotinyml.problem import CE_PROBLEMS, PR_PROBLEMS, WeightOptimizationProblem
 from evotinyml.validation import (
     class_metric_log_dict,
@@ -373,7 +377,7 @@ class StepOutput(Output):
 
         if self.use_wandb:
             labels = (
-                [f"c{j}" for j in range(F.shape[1])]
+                class_obj_labels(F.shape[1])
                 if self.is_ce_problem
                 else None
             )
@@ -543,15 +547,13 @@ class StepOutput(Output):
                     result.per_class_ce[knee_i],
                 )
             if self.use_wandb and self.is_ce_problem:
-                # Log val radar on the same cadence as train Pareto plots.
+                # Log val CE + Acc fronts on the same cadence as train Pareto plots.
                 if step == 1 or step % self.pareto_every == 0:
                     self._pending_pareto_images.update(
-                        pareto_front_images(
+                        val_class_pareto_images(
                             result.per_class_ce,
-                            problem_name=self.problem_name,
+                            result.per_class_acc,
                             step=step,
-                            key_prefix="val",
-                            obj_labels=[f"c{j}" for j in range(result.per_class_ce.shape[1])],
                         )
                     )
             print(
