@@ -120,7 +120,9 @@ class StableASEBO(_ASEBO):
 
         grad = grad / (jnp.linalg.norm(grad) / self.num_dims + 1e-8)
 
-        updates, opt_state = self.optimizer.update(grad, state.opt_state)
+        updates, opt_state = self.optimizer.update(
+            grad, state.opt_state, state.mean
+        )
         mean = optax.apply_updates(state.mean, updates)
 
         return state.replace(

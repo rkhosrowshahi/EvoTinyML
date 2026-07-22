@@ -62,6 +62,9 @@ DEFAULT_ES_OPTIM = "adam"
 DEFAULT_ES_OPTIM_LR = 0.01
 DEFAULT_ES_OPTIM_SCHEDULER = "constant"
 DEFAULT_ES_OPTIM_MOMENTUM = 0.9
+# Weight decay for mean Optax update (0 = off). adamw uses Optax decoupled WD;
+# sgd / adam / rmsprop chain optax.add_decayed_weights when wd > 0.
+DEFAULT_ES_OPTIM_WD = 0.0
 # OpenES / ASEBO / MO-OpenES sampling-noise (σ) schedule over steps.
 ES_SIGMA_SCHEDULERS = ("constant", "cosine", "exponential")
 DEFAULT_ES_SIGMA_SCHEDULER = "constant"
@@ -271,6 +274,7 @@ def build_open_es_optimizer(
     scheduler: str = DEFAULT_ES_OPTIM_SCHEDULER,
     steps: int = 1,
     momentum: float = DEFAULT_ES_OPTIM_MOMENTUM,
+    weight_decay: float = DEFAULT_ES_OPTIM_WD,
 ):
     """Build the Optax transform used to update the OpenES mean."""
     import optax
@@ -278,22 +282,29 @@ def build_open_es_optimizer(
     name = optim.lower()
     schedule = _build_lr_schedule(scheduler, lr, steps)
     mom = float(momentum)
+    wd = float(weight_decay)
     # optax: momentum=None disables the velocity buffer (sgd / rmsprop).
     mom_arg = None if mom <= 0.0 else mom
     if name == "sgd":
-        return optax.sgd(learning_rate=schedule, momentum=mom_arg)
-    if name == "rmsprop":
-        return optax.rmsprop(learning_rate=schedule, momentum=mom_arg)
-    if mom > 0.0:
-        print(
-            f"Note: --es-optim-momentum={mom} is ignored for --es-optim {name} "
-            f"(only used with {' / '.join(sorted(ES_OPTIMS_WITH_MOMENTUM))})."
-        )
-    if name == "adam":
-        return optax.adam(learning_rate=schedule)
-    if name == "adamw":
-        return optax.adamw(learning_rate=schedule)
-    raise ValueError(f"Unknown es_optim: {optim!r}. Use one of {ES_OPTIMS}.")
+        opt = optax.sgd(learning_rate=schedule, momentum=mom_arg)
+    elif name == "rmsprop":
+        opt = optax.rmsprop(learning_rate=schedule, momentum=mom_arg)
+    else:
+        if mom > 0.0:
+            print(
+                f"Note: --es-optim-momentum={mom} is ignored for --es-optim {name} "
+                f"(only used with {' / '.join(sorted(ES_OPTIMS_WITH_MOMENTUM))})."
+            )
+        if name == "adam":
+            opt = optax.adam(learning_rate=schedule)
+        elif name == "adamw":
+            # Decoupled WD is built into adamw (including wd == 0).
+            return optax.adamw(learning_rate=schedule, weight_decay=wd)
+        else:
+            raise ValueError(f"Unknown es_optim: {optim!r}. Use one of {ES_OPTIMS}.")
+    if wd > 0.0:
+        opt = optax.chain(optax.add_decayed_weights(wd), opt)
+    return opt
 
 
 def _fix_lm_ma_es_c_c(es, params, population_size: int, n_var: int):
@@ -339,6 +350,7 @@ def _build_evosax(
     es_optim_lr: float = DEFAULT_ES_OPTIM_LR,
     es_optim_scheduler: str = DEFAULT_ES_OPTIM_SCHEDULER,
     es_optim_momentum: float = DEFAULT_ES_OPTIM_MOMENTUM,
+    es_optim_wd: float = DEFAULT_ES_OPTIM_WD,
     es_sigma_scheduler: str = DEFAULT_ES_SIGMA_SCHEDULER,
     es_sigma_end: float | None = None,
     asebo_subspace_dims: int = DEFAULT_ASEBO_SUBSPACE_DIMS,
@@ -362,6 +374,7 @@ def _build_evosax(
 
     from evotinyml.soo.asebo_stable import StableASEBO
     from evotinyml.soo.jde import JDE
+    from evotinyml.soo.params_opt_es import OpenES, SNES, xNES
     from evotinyml.soo.pso_fixed import FixedPSO
 
     if algo not in EVOSAX_SOO_ALGOS:
@@ -372,6 +385,12 @@ def _build_evosax(
     cls_name, display_name = EVOSAX_SOO_ALGOS[algo]
     if algo == "asebo":
         Cls = StableASEBO
+    elif algo == "open_es":
+        Cls = OpenES
+    elif algo == "snes":
+        Cls = SNES
+    elif algo == "xnes":
+        Cls = xNES
     elif algo == "jde":
         Cls = JDE
     elif algo == "pso":
@@ -403,6 +422,7 @@ def _build_evosax(
             es_optim_scheduler,
             steps=steps,
             momentum=es_optim_momentum,
+            weight_decay=es_optim_wd,
         )
     if algo in SIGMA_SCHEDULE_ALGOS:
         kwargs["std_schedule"] = build_es_sigma_schedule(
@@ -490,6 +510,7 @@ def run_soo_es(
     es_optim_lr: float = DEFAULT_ES_OPTIM_LR,
     es_optim_scheduler: str = DEFAULT_ES_OPTIM_SCHEDULER,
     es_optim_momentum: float = DEFAULT_ES_OPTIM_MOMENTUM,
+    es_optim_wd: float = DEFAULT_ES_OPTIM_WD,
     es_sigma_scheduler: str = DEFAULT_ES_SIGMA_SCHEDULER,
     es_sigma_end: float | None = None,
     asebo_subspace_dims: int = DEFAULT_ASEBO_SUBSPACE_DIMS,
@@ -547,6 +568,7 @@ def run_soo_es(
         es_optim_lr=es_optim_lr,
         es_optim_scheduler=es_optim_scheduler,
         es_optim_momentum=es_optim_momentum,
+        es_optim_wd=es_optim_wd,
         es_sigma_scheduler=es_sigma_scheduler,
         es_sigma_end=es_sigma_end,
         asebo_subspace_dims=asebo_subspace_dims,
@@ -844,6 +866,7 @@ def build_soo_wandb_config(
     es_optim_lr = getattr(args, "es_optim_lr", DEFAULT_ES_OPTIM_LR)
     es_optim_scheduler = getattr(args, "es_optim_scheduler", DEFAULT_ES_OPTIM_SCHEDULER)
     es_optim_momentum = getattr(args, "es_optim_momentum", DEFAULT_ES_OPTIM_MOMENTUM)
+    es_optim_wd = getattr(args, "es_optim_wd", DEFAULT_ES_OPTIM_WD)
     es_sigma_scheduler = getattr(args, "es_sigma_scheduler", DEFAULT_ES_SIGMA_SCHEDULER)
     es_sigma_end = getattr(args, "es_sigma_end", None)
     asebo_subspace_dims = getattr(
@@ -887,6 +910,7 @@ def build_soo_wandb_config(
         "es_optim_lr": es_optim_lr,
         "es_optim_scheduler": es_optim_scheduler,
         "es_optim_momentum": es_optim_momentum,
+        "es_optim_wd": es_optim_wd,
         "es_sigma_scheduler": es_sigma_scheduler,
         "es_sigma_end": es_sigma_end,
         "asebo_subspace_dims": asebo_subspace_dims,
@@ -928,6 +952,7 @@ def build_soo_wandb_config(
             "es_optim_lr": es_optim_lr,
             "es_optim_scheduler": es_optim_scheduler,
             "es_optim_momentum": es_optim_momentum,
+            "es_optim_wd": es_optim_wd,
             "es_sigma_scheduler": es_sigma_scheduler,
             "es_sigma_end": es_sigma_end,
             "asebo_subspace_dims": asebo_subspace_dims,

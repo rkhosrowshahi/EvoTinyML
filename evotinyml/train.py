@@ -60,6 +60,7 @@ from evotinyml.soo.es import (
     DEFAULT_ES_OPTIM_LR,
     DEFAULT_ES_OPTIM_MOMENTUM,
     DEFAULT_ES_OPTIM_SCHEDULER,
+    DEFAULT_ES_OPTIM_WD,
     DEFAULT_ES_SIGMA_SCHEDULER,
     ES_OPTIMS,
     ES_OPTIM_SCHEDULERS,
@@ -327,6 +328,17 @@ def parse_args() -> argparse.Namespace:
             f"Momentum for sgd / rmsprop (0 = off) on open_es / snes / xnes / asebo. "
             f"Default: {DEFAULT_ES_OPTIM_MOMENTUM}. "
             "Ignored for adam/adamw and cmaes / cr_fm_nes / lm_ma_es / de / jde / pso."
+        ),
+    )
+    parser.add_argument(
+        "--es-optim-wd",
+        type=float,
+        default=DEFAULT_ES_OPTIM_WD,
+        help=(
+            f"Weight decay for mean Optax update on open_es / snes / xnes / asebo "
+            f"(0 = off). adamw: decoupled WD; sgd / adam / rmsprop: add_decayed_weights. "
+            f"Default: {DEFAULT_ES_OPTIM_WD}. "
+            "Ignored for cmaes / cr_fm_nes / lm_ma_es / de / jde / pso."
         ),
     )
     parser.add_argument(
@@ -1046,6 +1058,7 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
         or float(args.es_optim_lr) != DEFAULT_ES_OPTIM_LR
         or args.es_optim_scheduler != DEFAULT_ES_OPTIM_SCHEDULER
         or float(args.es_optim_momentum) != DEFAULT_ES_OPTIM_MOMENTUM
+        or float(args.es_optim_wd) != DEFAULT_ES_OPTIM_WD
     )
     es_sigma_opts_nondefault = (
         args.es_sigma_scheduler != DEFAULT_ES_SIGMA_SCHEDULER
@@ -1054,7 +1067,7 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
     if not uses_mean_optimizer and es_optim_opts_nondefault:
         print(
             f"Note: --es-optim / --es-optim-lr / --es-optim-scheduler / "
-            f"--es-optim-momentum are ignored for --algo {algo} "
+            f"--es-optim-momentum / --es-optim-wd are ignored for --algo {algo} "
             f"(open_es / snes / xnes / asebo only)."
         )
     if not uses_sigma_schedule and es_sigma_opts_nondefault:
@@ -1130,7 +1143,8 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
         es_banner = (
             f"  es_optim={args.es_optim}  es_optim_lr={args.es_optim_lr}  "
             f"es_optim_scheduler={args.es_optim_scheduler}  "
-            f"es_optim_momentum={args.es_optim_momentum}"
+            f"es_optim_momentum={args.es_optim_momentum}  "
+            f"es_optim_wd={args.es_optim_wd}"
         )
     if uses_sigma_schedule:
         end_str = (
@@ -1199,6 +1213,7 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
             es_optim_lr=args.es_optim_lr,
             es_optim_scheduler=args.es_optim_scheduler,
             es_optim_momentum=args.es_optim_momentum,
+            es_optim_wd=args.es_optim_wd,
             es_sigma_scheduler=args.es_sigma_scheduler,
             es_sigma_end=args.es_sigma_end,
             asebo_subspace_dims=args.asebo_subspace_dims,
@@ -1260,6 +1275,7 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
             es_optim_lr=args.es_optim_lr,
             es_optim_scheduler=args.es_optim_scheduler,
             es_optim_momentum=args.es_optim_momentum,
+            es_optim_wd=args.es_optim_wd,
             es_sigma_scheduler=args.es_sigma_scheduler,
             es_sigma_end=args.es_sigma_end if args.es_sigma_end is not None else -1.0,
             steps=args.steps,
@@ -1350,6 +1366,7 @@ def run_mo_es(args: argparse.Namespace, problem, test_loader, num_classes: int, 
         f"es_optim={args.es_optim}  es_optim_lr={args.es_optim_lr}  "
         f"es_optim_scheduler={args.es_optim_scheduler}  "
         f"es_optim_momentum={args.es_optim_momentum}  "
+        f"es_optim_wd={args.es_optim_wd}  "
         f"es_sigma_scheduler={args.es_sigma_scheduler}  "
         f"es_sigma_end={args.es_sigma_end if args.es_sigma_end is not None else 'default'}  "
         f"archive={args.archive_selection}({args.archive_size})"
@@ -1378,6 +1395,7 @@ def run_mo_es(args: argparse.Namespace, problem, test_loader, num_classes: int, 
         es_optim_lr=args.es_optim_lr,
         es_optim_scheduler=args.es_optim_scheduler,
         es_optim_momentum=args.es_optim_momentum,
+        es_optim_wd=args.es_optim_wd,
         es_sigma_scheduler=args.es_sigma_scheduler,
         es_sigma_end=args.es_sigma_end,
         archive_size=args.archive_size,
@@ -1454,6 +1472,7 @@ def run_mo_es(args: argparse.Namespace, problem, test_loader, num_classes: int, 
             es_optim_lr=args.es_optim_lr,
             es_optim_scheduler=args.es_optim_scheduler,
             es_optim_momentum=args.es_optim_momentum,
+            es_optim_wd=args.es_optim_wd,
             es_sigma_scheduler=args.es_sigma_scheduler,
             es_sigma_end=args.es_sigma_end if args.es_sigma_end is not None else -1.0,
             steps=args.steps,

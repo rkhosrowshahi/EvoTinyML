@@ -52,6 +52,7 @@ from evotinyml.soo.es import (
     DEFAULT_ES_OPTIM_LR,
     DEFAULT_ES_OPTIM_MOMENTUM,
     DEFAULT_ES_OPTIM_SCHEDULER,
+    DEFAULT_ES_OPTIM_WD,
     DEFAULT_ES_SIGMA_SCHEDULER,
     _init_mean,
     build_es_sigma_schedule,
@@ -237,6 +238,7 @@ class _MeanOptimizer:
         es_optim_lr: float,
         es_optim_scheduler: str,
         es_optim_momentum: float,
+        es_optim_wd: float,
         steps: int,
     ) -> None:
         import jax.numpy as jnp
@@ -250,6 +252,7 @@ class _MeanOptimizer:
             es_optim_scheduler,
             steps=steps,
             momentum=es_optim_momentum,
+            weight_decay=es_optim_wd,
         )
         self.mean = np.clip(np.asarray(mean0, dtype=np.float64), self.xl, self.xu)
         self._opt_state = self._optimizer.init(jnp.asarray(self.mean, dtype=jnp.float32))
@@ -990,6 +993,7 @@ def run_mgda_open_es(
     es_optim_lr: float = DEFAULT_ES_OPTIM_LR,
     es_optim_scheduler: str = DEFAULT_ES_OPTIM_SCHEDULER,
     es_optim_momentum: float = DEFAULT_ES_OPTIM_MOMENTUM,
+    es_optim_wd: float = DEFAULT_ES_OPTIM_WD,
     es_sigma_scheduler: str = DEFAULT_ES_SIGMA_SCHEDULER,
     es_sigma_end: float | None = None,
     archive_size: int = DEFAULT_ARCHIVE_SIZE,
@@ -1062,6 +1066,7 @@ def run_mgda_open_es(
         es_optim_lr=es_optim_lr,
         es_optim_scheduler=es_optim_scheduler,
         es_optim_momentum=es_optim_momentum,
+        es_optim_wd=es_optim_wd,
         steps=steps,
     )
     archive = NDArchive(
@@ -1248,6 +1253,7 @@ def run_moead_open_es(
     es_optim_lr: float = DEFAULT_ES_OPTIM_LR,
     es_optim_scheduler: str = DEFAULT_ES_OPTIM_SCHEDULER,
     es_optim_momentum: float = DEFAULT_ES_OPTIM_MOMENTUM,
+    es_optim_wd: float = DEFAULT_ES_OPTIM_WD,
     es_sigma_scheduler: str = DEFAULT_ES_SIGMA_SCHEDULER,
     es_sigma_end: float | None = None,
     archive_size: int = DEFAULT_ARCHIVE_SIZE,
@@ -1322,6 +1328,7 @@ def run_moead_open_es(
             es_optim_lr=es_optim_lr,
             es_optim_scheduler=es_optim_scheduler,
             es_optim_momentum=es_optim_momentum,
+            es_optim_wd=es_optim_wd,
             steps=steps,
         )
         for _ in range(k)
@@ -1530,6 +1537,7 @@ def build_mo_es_wandb_config(
         "es_optim_lr": getattr(args, "es_optim_lr", DEFAULT_ES_OPTIM_LR),
         "es_optim_scheduler": getattr(args, "es_optim_scheduler", DEFAULT_ES_OPTIM_SCHEDULER),
         "es_optim_momentum": getattr(args, "es_optim_momentum", DEFAULT_ES_OPTIM_MOMENTUM),
+        "es_optim_wd": getattr(args, "es_optim_wd", DEFAULT_ES_OPTIM_WD),
         "es_sigma_scheduler": getattr(args, "es_sigma_scheduler", DEFAULT_ES_SIGMA_SCHEDULER),
         "es_sigma_end": getattr(args, "es_sigma_end", None),
         "steps": args.steps,
@@ -1562,6 +1570,7 @@ def build_mo_es_wandb_config(
         "es_optim_lr": config["es_optim_lr"],
         "es_optim_scheduler": config["es_optim_scheduler"],
         "es_optim_momentum": config["es_optim_momentum"],
+        "es_optim_wd": config["es_optim_wd"],
         "es_sigma_scheduler": config["es_sigma_scheduler"],
         "es_sigma_end": config["es_sigma_end"],
         "archive_size": config["archive_size"],
