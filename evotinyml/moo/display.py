@@ -10,12 +10,20 @@ from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 from torch.utils.data import DataLoader
 
 from evotinyml.moo.pareto_history import FrontHistory
-from evotinyml.moo.pareto_plot import (
-    class_obj_labels,
-    pareto_front_images,
-    val_class_pareto_images,
+from evotinyml.moo.pareto_plot import pareto_front_images, val_class_pareto_images
+from evotinyml.fitness import (
+    L1_HV_REF,
+    l1_problem_metric_log_dict,
+    l1_val_front,
 )
-from evotinyml.problem import CE_PROBLEMS, PR_PROBLEMS, WeightOptimizationProblem
+from evotinyml.problem import (
+    CE_PROBLEMS,
+    CE_SOFT_PR_PROBLEMS,
+    L1_PROBLEMS,
+    PR_PROBLEMS,
+    WeightOptimizationProblem,
+    problem_obj_labels,
+)
 from evotinyml.validation import (
     class_metric_log_dict,
     per_class_acc_ce_on_eval_pool,
@@ -109,6 +117,8 @@ class StepOutput(Output):
         self.problem_name = problem_name
         self.is_precision_recall = problem_name in PR_PROBLEMS
         self.is_ce_problem = problem_name in CE_PROBLEMS
+        self.is_ce_soft_pr = problem_name in CE_SOFT_PR_PROBLEMS
+        self.is_l1_problem = problem_name in L1_PROBLEMS
         self.use_wandb = use_wandb
         self.max_steps = int(max_steps) if max_steps is not None else None
         self.pareto_every = max(1, int(pareto_every))
@@ -163,6 +173,16 @@ class StepOutput(Output):
                 self.min_f,
                 self.hv,
             ]
+            if self.is_l1_problem:
+                if self.problem_name == "cross_entropy_l1":
+                    knee_task_name = "knee_CE"
+                elif self.problem_name == "soft_f1_l1":
+                    knee_task_name = "knee_softF1"
+                else:
+                    knee_task_name = "knee_F1"
+                self.knee_task = Column(knee_task_name, width=max(12, len(knee_task_name) + 2))
+                self.knee_l1 = Column("knee_L1", width=10)
+                self.columns[4:4] = [self.knee_task, self.knee_l1]
 
         self.hv_samples = hv_samples
         self.hv_seed = hv_seed
@@ -175,25 +195,27 @@ class StepOutput(Output):
         self._archive: np.ndarray | None = None
         self._hv_exact: HV | None = None
         self._last_hv: float = 0.0
-        self._seen_batch_version: int | None = None
-
         self._last_val_acc: float | None = None
         self._last_val_f1: float | None = None
         self._last_best_acc: float | None = None
         self._last_best_f1: float | None = None
         self._last_hv_acc: float | None = None
         self._last_hv_f1: float | None = None
+        self._last_hv_l1: float | None = None
         self._last_knee_prec: float | None = None
         self._last_knee_rec: float | None = None
         self._last_knee_pr_mean: float | None = None
         self._last_knee_f1: float | None = None
         self._last_knee_acc: float | None = None
+        self._last_knee_l1: float | None = None
         self._last_hv_pr: float | None = None
         self._last_val_n_nd: int | None = None
         self._last_wandb_n_eval: int | None = None
         self._validated_this_step: bool = False
         self._last_class_train: dict[str, float] = {}
         self._last_class_val: dict[str, float] = {}
+        self._last_l1_train: dict[str, float] = {}
+        self._last_l1_val: dict[str, float] = {}
         self._pending_pareto_images: dict = {}
 
     def collect_train_metrics(self, algorithm) -> dict[str, float | int]:
@@ -225,6 +247,26 @@ class StepOutput(Output):
             metrics["train/recall"] = float(recall[knee_i])
             metrics["train/f"] = float(F_opt[knee_i, 0] + F_opt[knee_i, 1])
             metrics["train/mean_f"] = float(metrics["train/f"])
+        elif self.is_ce_soft_pr and F_opt.ndim == 2 and F_opt.shape[1] >= 3:
+            knee_i = _knee_index_utopia(F_opt)
+            metrics["train/ce"] = float(F_opt[knee_i, 0])
+            metrics["train/precision"] = float(1.0 - F_opt[knee_i, 1])
+            metrics["train/recall"] = float(1.0 - F_opt[knee_i, 2])
+            metrics["train/f"] = float(np.mean(F_opt[knee_i]))
+            metrics["train/mean_f"] = float(np.mean(F_opt, axis=0).mean())
+            metrics["train/min_f"] = float(np.min(np.mean(F_opt, axis=1)))
+            metrics["train/knee_f"] = float(metrics["train/f"])
+        elif self.is_l1_problem and F_opt.ndim == 2 and F_opt.shape[1] >= 2:
+            knee_i = _knee_index_utopia(F_opt)
+            self._last_l1_train = l1_problem_metric_log_dict(
+                "train", self.problem_name, F_opt[knee_i]
+            )
+            metrics.update(self._last_l1_train)
+            metrics["train/f"] = float(np.mean(F_opt[knee_i]))
+            metrics["train/mean_f"] = float(np.mean(F_opt, axis=0).mean())
+            metrics["train/min_f"] = float(np.min(np.mean(F_opt, axis=1)))
+            metrics["train/knee_f"] = float(metrics["train/f"])
+            metrics["train/knee_l1"] = float(F_opt[knee_i, 1])
         else:
             per_ind = np.mean(F_opt, axis=1)
             metrics["train/mean_f"] = float(np.mean(per_ind))
@@ -288,11 +330,19 @@ class StepOutput(Output):
                 metrics["val/mean_acc"] = float(self._last_val_acc)
             if self._last_val_f1 is not None:
                 metrics["val/mean_f1"] = float(self._last_val_f1)
-            if self._last_hv_acc is not None:
-                metrics["val/hv_acc"] = float(self._last_hv_acc)
-            if self._last_hv_f1 is not None:
-                metrics["val/hv_f1"] = float(self._last_hv_f1)
+            if self.is_l1_problem:
+                if self._last_hv_l1 is not None:
+                    metrics["val/hv"] = float(self._last_hv_l1)
+            else:
+                if self._last_hv_acc is not None:
+                    metrics["val/hv_acc"] = float(self._last_hv_acc)
+                if self._last_hv_f1 is not None:
+                    metrics["val/hv_f1"] = float(self._last_hv_f1)
             metrics.update(self._last_class_val)
+            metrics.update(self._last_l1_val)
+            if self._last_knee_l1 is not None:
+                metrics["val/knee_l1"] = float(self._last_knee_l1)
+                metrics["val/l1"] = float(self._last_knee_l1)
         return metrics
 
     def final_summary_metrics(self) -> dict[str, float | int]:
@@ -313,10 +363,14 @@ class StepOutput(Output):
                 out["final/knee_f1"] = float(self._last_knee_f1)
             if self._last_knee_acc is not None:
                 out["final/knee_acc"] = float(self._last_knee_acc)
+            if self._last_knee_l1 is not None:
+                out["final/knee_l1"] = float(self._last_knee_l1)
         elif self._last_knee_acc is not None:
             out["final/knee_acc"] = float(self._last_knee_acc)
             if self._last_knee_f1 is not None:
                 out["final/knee_f1"] = float(self._last_knee_f1)
+            if self._last_knee_l1 is not None:
+                out["final/knee_l1"] = float(self._last_knee_l1)
         return out
 
     def log_wandb(
@@ -376,11 +430,9 @@ class StepOutput(Output):
             history = self.train_history.iter_fronts()
 
         if self.use_wandb:
-            labels = (
-                class_obj_labels(F.shape[1])
-                if self.is_ce_problem
-                else None
-            )
+            labels = problem_obj_labels(self.problem_name, F.shape[1])
+            # NSGA has no ES mean: center = average of the current ND front.
+            center_F = np.mean(F, axis=0)
             self._pending_pareto_images.update(
                 pareto_front_images(
                     F,
@@ -388,23 +440,23 @@ class StepOutput(Output):
                     step=step,
                     key_prefix="train",
                     history=history,
+                    highlight=center_F,
+                    highlight_label="center",
                     obj_labels=labels,
                 )
             )
 
-    def _sync_batch_window(self, algorithm) -> None:
-        problem = algorithm.problem
-        version = getattr(problem, "batch_version", 0)
-        if self._seen_batch_version is None:
-            self._seen_batch_version = version
-            return
-        if version != self._seen_batch_version:
-            self._archive = None
-            self._last_hv = 0.0
-            self._seen_batch_version = version
 
     def _ensure_hv_anchors(self, algorithm) -> None:
-        if self.nadir is not None:
+        if self.ref_point is not None:
+            return
+
+        # Task+L1: fixed ref [1, 1] on raw (task, L1); no nadir scaling.
+        if self.is_l1_problem:
+            self.nadir = L1_HV_REF.copy()
+            self.ref_point = L1_HV_REF.copy()
+            self._hv_exact = HV(ref_point=self.ref_point, norm_ref_point=False)
+            print("HV: L1 problems use fixed ref = [1.0, 1.0] (no nadir scaling)")
             return
 
         problem = algorithm.problem
@@ -430,12 +482,16 @@ class StepOutput(Output):
             self._hv_exact = HV(ref_point=self.ref_point, norm_ref_point=False)
 
     def _compute_train_hv(self, F: np.ndarray) -> float | None:
-        if self.nadir is None or self.ref_point is None or F is None or len(F) == 0:
+        if self.ref_point is None or F is None or len(F) == 0:
             return None
-        F_norm = _normalize_by_nadir(F, self.nadir)
+        F_use = np.asarray(F, dtype=float)
+        if not self.is_l1_problem:
+            if self.nadir is None:
+                return None
+            F_use = _normalize_by_nadir(F_use, self.nadir)
         return _hv_unit_front(
-            F_norm,
-            n_obj=F_norm.shape[1],
+            F_use,
+            n_obj=F_use.shape[1],
             hv_exact=self._hv_exact,
             hv_samples=self.hv_samples,
             hv_seed=self.hv_seed,
@@ -508,6 +564,8 @@ class StepOutput(Output):
                             if self.val_history is not None
                             else None
                         ),
+                        highlight=np.mean(result.error_pr, axis=0),
+                        highlight_label="center",
                     )
                 )
             print(
@@ -517,18 +575,72 @@ class StepOutput(Output):
                 f"knee_pr_mean={knee['pr_mean']:.4f}  knee_f1={knee['f1']:.4f}  "
                 f"knee_acc={knee['acc']:.4f}  HV_PR={hv_pr:.6f}"
             )
+        elif self.is_l1_problem:
+            F_val = l1_val_front(
+                self.problem_name,
+                X,
+                mean_ce=result.mean_ce,
+                macro_f1=result.macro_f1,
+            )
+            hv_l1 = _hv_unit_front(
+                F_val,
+                n_obj=2,
+                hv_exact=HV(ref_point=L1_HV_REF, norm_ref_point=False),
+                hv_samples=self.hv_samples,
+                hv_seed=self.hv_seed,
+            )
+            knee_i = _knee_index_utopia(F_val)
+            self._last_val_acc = result.mean_acc
+            self._last_val_f1 = result.mean_f1
+            self._last_hv_l1 = hv_l1
+            self._last_knee_acc = float(result.overall_acc[knee_i])
+            self._last_knee_f1 = float(result.macro_f1[knee_i])
+            self._last_knee_l1 = float(F_val[knee_i, 1])
+            self._last_l1_val = l1_problem_metric_log_dict(
+                "val", self.problem_name, F_val[knee_i]
+            )
+            if self.use_wandb and (step == 1 or step % self.pareto_every == 0):
+                labels = problem_obj_labels(self.problem_name, 2)
+                self._pending_pareto_images.update(
+                    pareto_front_images(
+                        F_val,
+                        problem_name=self.problem_name,
+                        step=step,
+                        key_prefix="val",
+                        highlight=np.mean(F_val, axis=0),
+                        highlight_label="center",
+                        obj_labels=labels,
+                    )
+                )
+            print(
+                f"[step {step}] test ND (n={len(X)}): "
+                f"acc_best={result.best_acc:.4f}  f1_best={result.best_f1:.4f}  "
+                f"knee_acc={self._last_knee_acc:.4f}  knee_f1={self._last_knee_f1:.4f}  "
+                f"knee_l1={self._last_knee_l1:.6f}  "
+                f"mean_acc={result.mean_acc:.4f}  mean_f1={result.mean_f1:.4f}  "
+                f"HV={hv_l1:.6f}"
+            )
         else:
+            hv_exact_cls = (
+                self._hv_exact
+                if (
+                    self._hv_exact is not None
+                    and self.ref_point is not None
+                    and len(self.ref_point) == self.n_classes
+                )
+                else None
+            )
             hv_acc = _hv_unit_front(
                 result.error_acc,
                 n_obj=self.n_classes,
-                hv_exact=self._hv_exact if self.n_classes <= 3 else None,
+                hv_exact=hv_exact_cls,
                 hv_samples=self.hv_samples,
                 hv_seed=self.hv_seed,
             )
             hv_f1 = _hv_unit_front(
                 result.error_f1,
                 n_obj=self.n_classes,
-                hv_exact=self._hv_exact if self.n_classes <= 3 else None,
+                hv_exact=hv_exact_cls,
                 hv_samples=self.hv_samples,
                 hv_seed=self.hv_seed,
             )
@@ -572,7 +684,6 @@ class StepOutput(Output):
         self.step.set(algorithm.n_gen)
         n_eval = getattr(getattr(algorithm, "evaluator", None), "n_eval", None)
         self.n_eval.set("-" if n_eval is None else int(n_eval))
-        self._sync_batch_window(algorithm)
         self._ensure_hv_anchors(algorithm)
 
         F_pop = algorithm.pop.get("F")
@@ -594,6 +705,9 @@ class StepOutput(Output):
             else:
                 self.mean_f.set("-")
                 self.min_f.set("-")
+                if self.is_l1_problem:
+                    self.knee_task.set("-")
+                    self.knee_l1.set("-")
             return
 
         F_opt = np.asarray(F_opt, dtype=float)
@@ -619,6 +733,13 @@ class StepOutput(Output):
             per_ind = np.mean(F_opt, axis=1)
             self.mean_f.set(f"{float(np.mean(per_ind)):.4e}")
             self.min_f.set(f"{float(np.min(per_ind)):.4e}")
+            if self.is_l1_problem and F_opt.ndim == 2 and F_opt.shape[1] >= 2:
+                knee_i = _knee_index_utopia(F_opt)
+                if self.problem_name == "cross_entropy_l1":
+                    self.knee_task.set(f"{float(F_opt[knee_i, 0]):.4f}")
+                else:
+                    self.knee_task.set(f"{float(1.0 - F_opt[knee_i, 0]):.4f}")
+                self.knee_l1.set(f"{float(F_opt[knee_i, 1]):.4f}")
 
         source = F_pop if F_pop is not None and len(F_pop) else F_opt
         self._archive = _update_nd_archive(self._archive, source)

@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
+import numpy as np
+import torch
 import wandb
 
 from evotinyml.moo.algorithms import OperatorConfig
-
-
 DEFAULT_ENTITY = "rasa_research"
 DEFAULT_PROJECT = "EvoTinyML-Precision-Recall"
 # W&B x-axis key (function evaluations).
 FE_METRIC = "Function Evaluations"
+# Final model file written into ``wandb.run.dir`` (auto-uploaded on finish).
+CHECKPOINT_NAME = "checkpoint.pt.tar"
 
 
 def make_run_name(dataset: str, algo: str, seed: int, name: str | None = None) -> str:
@@ -67,13 +70,15 @@ def build_wandb_config(
         "algo": args.algo,
         "init": args.init,
         "init_sigma": getattr(args, "init_sigma", 0.1),
+        "xl": getattr(args, "xl", -10.0),
+        "xu": getattr(args, "xu", 10.0),
         "steps": args.steps,
         "evals": getattr(args, "evals", None),
         "popsize": args.popsize,
         "batch_size": args.batch_size,
-        "eval_mode": getattr(args, "eval_mode", "single"),
-        "eval_batches": getattr(args, "eval_batches", 8),
-        "resample_every": args.resample_every,
+        "eval_mode": getattr(args, "eval_mode", "multi"),
+        "eval_batches": getattr(args, "eval_batches", 50),
+        "sampler": getattr(args, "sampler", "auto"),
         "val_every": args.val_every,
         "pareto_every": getattr(args, "pareto_every", 100),
         "train_history": getattr(args, "train_history", "train_history.npz"),
@@ -184,6 +189,38 @@ def log_metrics(
         wandb.log(payload, step=fe)
     else:
         wandb.log(payload)
+
+
+def save_wandb_checkpoint(
+    problem,
+    flat: np.ndarray,
+    *,
+    meta: dict[str, Any] | None = None,
+) -> Path | None:
+    """Save final weights into the active W&B run dir as ``checkpoint.pt.tar``.
+
+    Files under ``wandb.run.dir`` are synced to the cloud when the run finishes.
+    No-op (returns ``None``) when wandb is disabled / not initialized.
+    """
+    if wandb.run is None:
+        return None
+
+    flat = np.asarray(flat, dtype=np.float64).ravel()
+    problem.set_weights(flat)
+    payload: dict[str, Any] = {
+        "model_state_dict": {
+            k: v.detach().cpu().clone() for k, v in problem.model.state_dict().items()
+        },
+        "weights": flat,
+    }
+    if meta:
+        payload.update(meta)
+
+    path = Path(wandb.run.dir) / CHECKPOINT_NAME
+    torch.save(payload, path)
+    # Explicitly mark for upload (also covered by living under run.dir).
+    wandb.save(str(path), base_path=str(path.parent), policy="now", glob=False)
+    return path
 
 
 def finish_wandb(summary: dict[str, Any] | None = None) -> None:

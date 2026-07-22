@@ -10,34 +10,75 @@ import torch.nn.functional as F
 from pymoo.core.problem import Problem
 from torch import nn
 
-from evotinyml.data import EVAL_MODES, ClassGuaranteedBatchSampler, RandomBatchSampler
+from evotinyml.data import EVAL_MODES, ClassBalancedSampler, RandomBatchSampler
 from evotinyml.fitness import (
+    CESoftPrecisionRecallMetrics,
+    CrossEntropyL1Metrics,
     CrossEntropyMetrics,
+    F1L1Metrics,
+    F1Metrics,
     MOOFitness,
+    ProblemObjectiveMetrics,
     SOOFitness,
+    SoftF1L1Metrics,
+    SoftF1Metrics,
     SoftPrecisionRecallMetrics,
+    default_scalar_weights,
+    parse_scalar_weights,
 )
 
 PROBLEMS = (
     "cwrm_cross_entropy",
     "precision_recall",
     "soft_precision_recall",
+    "ce_soft_precision_recall",
     "erm_cross_entropy",
+    "erm_f1",
+    "erm_soft_f1",
+    "cross_entropy_l1",
+    "f1_l1",
+    "soft_f1_l1",
 )
 # Problems that expose a 2-obj (1-P, 1-R) front in train/display/W&B.
 PR_PROBLEMS = frozenset({"precision_recall", "soft_precision_recall"})
+# 3-obj CE + soft P/R (minimized as CE, 1-P, 1-R).
+CE_SOFT_PR_PROBLEMS = frozenset({"ce_soft_precision_recall"})
+# Bi-objective task + mean |θ| sparsity (no new genotype vars).
+L1_PROBLEMS = frozenset({"cross_entropy_l1", "f1_l1", "soft_f1_l1"})
 # Cross-entropy problems that log per-class acc / CE.
 CE_PROBLEMS = frozenset({"cwrm_cross_entropy", "erm_cross_entropy"})
-# Scalar problems accepted by SOO ES (cmaes / snes / xnes / open_es).
-SOO_PROBLEMS = frozenset({"soft_precision_recall", "erm_cross_entropy"})
-# SOO-only (reject NSGA).
-SOO_ONLY_PROBLEMS = frozenset({"erm_cross_entropy"})
+# All problems accept SOO ES (multi-obj via weighted-sum scalarization).
+SOO_PROBLEMS = frozenset(PROBLEMS)
+# SOO-only (reject NSGA / MO-ES).
+SOO_ONLY_PROBLEMS = frozenset({"erm_cross_entropy", "erm_f1", "erm_soft_f1"})
+# Multi-objective problems (vector F; SOO uses w·F).
+MOO_PROBLEMS = frozenset(p for p in PROBLEMS if p not in SOO_ONLY_PROBLEMS)
 # Backward-compatible CLI aliases → canonical problem name.
 PROBLEM_ALIASES = {
     "per_class_ce": "cwrm_cross_entropy",
     "cwce": "cwrm_cross_entropy",
     "cross_entropy": "erm_cross_entropy",
+    "f1": "erm_f1",
+    "soft_f1": "erm_soft_f1",
+    "ce_soft_pr": "ce_soft_precision_recall",
+    "ce_l1": "cross_entropy_l1",
 }
+
+
+def problem_obj_labels(problem_name: str, n_obj: int) -> list[str] | None:
+    """Axis labels for Pareto plots, or ``None`` to use plot defaults."""
+    name = PROBLEM_ALIASES.get(problem_name.lower(), problem_name.lower())
+    if name in CE_SOFT_PR_PROBLEMS:
+        return list(CESoftPrecisionRecallMetrics.OBJ_LABELS)
+    if name == "cross_entropy_l1":
+        return list(CrossEntropyL1Metrics.OBJ_LABELS)
+    if name == "f1_l1":
+        return list(F1L1Metrics.OBJ_LABELS)
+    if name == "soft_f1_l1":
+        return list(SoftF1L1Metrics.OBJ_LABELS)
+    if name in CE_PROBLEMS and name != "erm_cross_entropy":
+        return [f"Class {i}" for i in range(int(n_obj))]
+    return None
 
 
 class BatchSampler(Protocol):
@@ -49,19 +90,23 @@ class BatchSampler(Protocol):
 
 
 class WeightOptimizationProblem(Problem):
-    """Shared machinery for evolving TinyCNN weights on an eval batch pool."""
+    """Shared machinery for evolving TinyCNN weights on an eval batch pool.
+
+    The pool is drawn by the batch sampler and shared by all individuals in one
+    evaluation call (CRN). Call ``sample_eval_pool`` once per generation.
+    ``eval_mode`` only controls pool *size* (one batch vs many).
+    """
 
     def __init__(
         self,
         model: nn.Module,
         batch_sampler: BatchSampler,
         n_obj: int,
-        xl: float = -1.0,
-        xu: float = 1.0,
+        xl: float = -10.0,
+        xu: float = 10.0,
         device: torch.device | None = None,
-        resample_every: int = 50,
-        eval_mode: str = "single",
-        eval_batches: int = 8,
+        eval_mode: str = "multi",
+        eval_batches: int = 50,
     ) -> None:
         self.model = model
         self.batch_sampler = batch_sampler
@@ -75,8 +120,6 @@ class WeightOptimizationProblem(Problem):
         self.eval_mode = eval_mode
         self.eval_batches = 1 if eval_mode == "single" else max(1, int(eval_batches))
 
-        self.resample_every = max(1, int(resample_every))
-        self.batch_version = 0
         self.hv_ideal: np.ndarray | None = None
         self.hv_nadir: np.ndarray | None = None
         self.problem_name = "weight"
@@ -88,19 +131,25 @@ class WeightOptimizationProblem(Problem):
             [p.detach().cpu().numpy().ravel() for p in self.model.parameters()]
         ).astype(np.float64)
 
-        # Cached pool of eval batches shared by the whole population.
+        # Eval batch pool shared by the whole population (CRN within a generation).
+        # Drawn via the sampler each generation (see sample_eval_pool).
         self.eval_batch_pool: list[tuple[torch.Tensor, torch.Tensor]] = []
-        self.resample_batch()
+        self.sample_eval_pool()
 
         super().__init__(n_var=self._n_var, n_obj=n_obj, xl=xl, xu=xu)
 
-    def resample_batch(self) -> None:
-        """Draw a new eval batch pool and bump ``batch_version``."""
+    def sample_eval_pool(self) -> None:
+        """Sample a fresh eval minibatch pool with ``batch_sampler``.
+
+        ``eval_mode=single`` → one batch of ``batch_size``; ``multi`` →
+        ``eval_batches`` batches pooled for metrics. Call once per generation
+        so the population shares the same data (CRN); do not call between
+        population fitness and the reported mean/best on that generation.
+        """
         raw = self.batch_sampler.sample_batches(self.eval_batches)
         self.eval_batch_pool = [
             (inputs.to(self.device), targets.to(self.device)) for inputs, targets in raw
         ]
-        self.batch_version += 1
 
     def set_hv_anchors_from_F(self, F: np.ndarray) -> None:
         """Set HV ideal/nadir once from the initial population (no-op if already set)."""
@@ -135,6 +184,8 @@ class WeightOptimizationProblem(Problem):
         raise NotImplementedError
 
     def _evaluate(self, X, out, *args, **kwargs):
+        # Fresh minibatch(es) via the sampler once per pymoo evaluation call.
+        self.sample_eval_pool()
         F_mat = np.empty((X.shape[0], self.n_obj), dtype=np.float64)
         for i in range(X.shape[0]):
             F_mat[i] = self._evaluate_individual(X[i])
@@ -152,12 +203,11 @@ class CWRMCrossEntropyProblem(WeightOptimizationProblem):
         self,
         model: nn.Module,
         batch_sampler: BatchSampler,
-        xl: float = -1.0,
-        xu: float = 1.0,
+        xl: float = -10.0,
+        xu: float = 10.0,
         device: torch.device | None = None,
-        resample_every: int = 50,
-        eval_mode: str = "single",
-        eval_batches: int = 8,
+        eval_mode: str = "multi",
+        eval_batches: int = 50,
     ) -> None:
         super().__init__(
             model=model,
@@ -166,11 +216,15 @@ class CWRMCrossEntropyProblem(WeightOptimizationProblem):
             xl=xl,
             xu=xu,
             device=device,
-            resample_every=resample_every,
             eval_mode=eval_mode,
             eval_batches=eval_batches,
         )
         self.problem_name = "cwrm_cross_entropy"
+        self.metrics = ProblemObjectiveMetrics(self, fitness_name="cwrm_ce")
+        self.soo_fitness = SOOFitness(
+            self.metrics,
+            scalar_weights=default_scalar_weights(self.problem_name, self.n_obj),
+        )
 
     def _evaluate_individual(self, flat: np.ndarray) -> np.ndarray:
         self.set_weights(flat)
@@ -213,12 +267,11 @@ class PrecisionRecallProblem(WeightOptimizationProblem):
         self,
         model: nn.Module,
         batch_sampler: BatchSampler,
-        xl: float = -1.0,
-        xu: float = 1.0,
+        xl: float = -10.0,
+        xu: float = 10.0,
         device: torch.device | None = None,
-        resample_every: int = 50,
-        eval_mode: str = "single",
-        eval_batches: int = 8,
+        eval_mode: str = "multi",
+        eval_batches: int = 50,
     ) -> None:
         super().__init__(
             model=model,
@@ -227,11 +280,15 @@ class PrecisionRecallProblem(WeightOptimizationProblem):
             xl=xl,
             xu=xu,
             device=device,
-            resample_every=resample_every,
             eval_mode=eval_mode,
             eval_batches=eval_batches,
         )
         self.problem_name = "precision_recall"
+        self.metrics = ProblemObjectiveMetrics(self, fitness_name="1-P,1-R")
+        self.soo_fitness = SOOFitness(
+            self.metrics,
+            scalar_weights=default_scalar_weights(self.problem_name, self.n_obj),
+        )
 
     def _macro_precision_recall(
         self, pred: torch.Tensor, targets: torch.Tensor
@@ -270,12 +327,11 @@ class SoftPrecisionRecallProblem(WeightOptimizationProblem):
         self,
         model: nn.Module,
         batch_sampler: BatchSampler,
-        xl: float = -1.0,
-        xu: float = 1.0,
+        xl: float = -10.0,
+        xu: float = 10.0,
         device: torch.device | None = None,
-        resample_every: int = 50,
-        eval_mode: str = "single",
-        eval_batches: int = 8,
+        eval_mode: str = "multi",
+        eval_batches: int = 50,
         temperature: float = 1.0,
     ) -> None:
         super().__init__(
@@ -285,7 +341,6 @@ class SoftPrecisionRecallProblem(WeightOptimizationProblem):
             xl=xl,
             xu=xu,
             device=device,
-            resample_every=resample_every,
             eval_mode=eval_mode,
             eval_batches=eval_batches,
         )
@@ -293,7 +348,52 @@ class SoftPrecisionRecallProblem(WeightOptimizationProblem):
         self.problem_name = "soft_precision_recall"
         self.metrics = SoftPrecisionRecallMetrics(self, temperature=temperature)
         self.moo_fitness = MOOFitness(self.metrics)
-        self.soo_fitness = SOOFitness(self.metrics)
+        self.soo_fitness = SOOFitness(
+            self.metrics,
+            scalar_weights=default_scalar_weights(self.problem_name, self.n_obj),
+        )
+
+    def _evaluate_individual(self, flat: np.ndarray) -> np.ndarray:
+        return self.moo_fitness.evaluate_one(flat)
+
+
+class CESoftPrecisionRecallProblem(WeightOptimizationProblem):
+    """Three-objective problem: mean CE, soft precision, soft recall.
+
+    Minimization vector ``F = (CE, 1−soft_P, 1−soft_R)`` computed from one
+    forward on the eval pool
+    (:class:`~evotinyml.fitness.CESoftPrecisionRecallMetrics`).
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        batch_sampler: BatchSampler,
+        xl: float = -10.0,
+        xu: float = 10.0,
+        device: torch.device | None = None,
+        eval_mode: str = "multi",
+        eval_batches: int = 50,
+        temperature: float = 1.0,
+    ) -> None:
+        super().__init__(
+            model=model,
+            batch_sampler=batch_sampler,
+            n_obj=3,
+            xl=xl,
+            xu=xu,
+            device=device,
+            eval_mode=eval_mode,
+            eval_batches=eval_batches,
+        )
+        self.temperature = float(temperature)
+        self.problem_name = "ce_soft_precision_recall"
+        self.metrics = CESoftPrecisionRecallMetrics(self, temperature=temperature)
+        self.moo_fitness = MOOFitness(self.metrics)
+        self.soo_fitness = SOOFitness(
+            self.metrics,
+            scalar_weights=default_scalar_weights(self.problem_name, self.n_obj),
+        )
 
     def _evaluate_individual(self, flat: np.ndarray) -> np.ndarray:
         return self.moo_fitness.evaluate_one(flat)
@@ -303,19 +403,19 @@ class ERMCrossEntropyProblem(WeightOptimizationProblem):
     """Empirical risk minimization with mean cross-entropy (ERM–CE).
 
     Single-objective mean CE on the eval batch pool. Intended for SOO ES
-    (``--algo cmaes`` / ``snes`` / ``xnes`` / ``open_es``). Not for NSGA.
+    (``--algo cmaes`` / ``snes`` / ``xnes`` / ``open_es`` / ``cr_fm_nes`` /
+    ``asebo`` / ``lm_ma_es`` / ``de`` / ``jde`` / ``pso``). Not for NSGA.
     """
 
     def __init__(
         self,
         model: nn.Module,
         batch_sampler: BatchSampler,
-        xl: float = -1.0,
-        xu: float = 1.0,
+        xl: float = -10.0,
+        xu: float = 10.0,
         device: torch.device | None = None,
-        resample_every: int = 50,
-        eval_mode: str = "single",
-        eval_batches: int = 8,
+        eval_mode: str = "multi",
+        eval_batches: int = 50,
     ) -> None:
         super().__init__(
             model=model,
@@ -324,7 +424,6 @@ class ERMCrossEntropyProblem(WeightOptimizationProblem):
             xl=xl,
             xu=xu,
             device=device,
-            resample_every=resample_every,
             eval_mode=eval_mode,
             eval_batches=eval_batches,
         )
@@ -340,23 +439,228 @@ class ERMCrossEntropyProblem(WeightOptimizationProblem):
 CrossEntropyProblem = ERMCrossEntropyProblem
 
 
+class ERMF1Problem(WeightOptimizationProblem):
+    """Empirical risk minimization with hard macro-F1 (ERM–F1).
+
+    Single-objective ``f = 1 − macro-F1`` on the eval batch pool. Intended for
+    SOO ES; not for NSGA.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        batch_sampler: BatchSampler,
+        xl: float = -10.0,
+        xu: float = 10.0,
+        device: torch.device | None = None,
+        eval_mode: str = "multi",
+        eval_batches: int = 50,
+    ) -> None:
+        super().__init__(
+            model=model,
+            batch_sampler=batch_sampler,
+            n_obj=1,
+            xl=xl,
+            xu=xu,
+            device=device,
+            eval_mode=eval_mode,
+            eval_batches=eval_batches,
+        )
+        self.problem_name = "erm_f1"
+        self.metrics = F1Metrics(self)
+        self.soo_fitness = SOOFitness(self.metrics)
+
+    def _evaluate_individual(self, flat: np.ndarray) -> np.ndarray:
+        return np.asarray([self.soo_fitness.evaluate_one(flat)["f"]], dtype=np.float64)
+
+
+class ERMSoftF1Problem(WeightOptimizationProblem):
+    """Empirical risk minimization with soft macro-F1 (ERM–soft-F1).
+
+    Single-objective ``f = 1 − soft macro-F1`` on the eval batch pool. Intended
+    for SOO ES; not for NSGA.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        batch_sampler: BatchSampler,
+        xl: float = -10.0,
+        xu: float = 10.0,
+        device: torch.device | None = None,
+        eval_mode: str = "multi",
+        eval_batches: int = 50,
+        temperature: float = 1.0,
+    ) -> None:
+        super().__init__(
+            model=model,
+            batch_sampler=batch_sampler,
+            n_obj=1,
+            xl=xl,
+            xu=xu,
+            device=device,
+            eval_mode=eval_mode,
+            eval_batches=eval_batches,
+        )
+        self.temperature = float(temperature)
+        self.problem_name = "erm_soft_f1"
+        self.metrics = SoftF1Metrics(self, temperature=temperature)
+        self.soo_fitness = SOOFitness(self.metrics)
+
+    def _evaluate_individual(self, flat: np.ndarray) -> np.ndarray:
+        return np.asarray([self.soo_fitness.evaluate_one(flat)["f"]], dtype=np.float64)
+
+
+class CrossEntropyL1Problem(WeightOptimizationProblem):
+    """Two-objective: mean CE and mean |θ| (``F = (CE, L1)``)."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        batch_sampler: BatchSampler,
+        xl: float = -10.0,
+        xu: float = 10.0,
+        device: torch.device | None = None,
+        eval_mode: str = "multi",
+        eval_batches: int = 50,
+    ) -> None:
+        super().__init__(
+            model=model,
+            batch_sampler=batch_sampler,
+            n_obj=2,
+            xl=xl,
+            xu=xu,
+            device=device,
+            eval_mode=eval_mode,
+            eval_batches=eval_batches,
+        )
+        self.problem_name = "cross_entropy_l1"
+        self.metrics = CrossEntropyL1Metrics(self)
+        self.moo_fitness = MOOFitness(self.metrics)
+        self.soo_fitness = SOOFitness(
+            self.metrics,
+            scalar_weights=default_scalar_weights(self.problem_name, self.n_obj),
+        )
+
+    def _evaluate_individual(self, flat: np.ndarray) -> np.ndarray:
+        return self.moo_fitness.evaluate_one(flat)
+
+
+class F1L1Problem(WeightOptimizationProblem):
+    """Two-objective: hard macro-F1 and mean |θ| (``F = (1−F1, L1)``)."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        batch_sampler: BatchSampler,
+        xl: float = -10.0,
+        xu: float = 10.0,
+        device: torch.device | None = None,
+        eval_mode: str = "multi",
+        eval_batches: int = 50,
+    ) -> None:
+        super().__init__(
+            model=model,
+            batch_sampler=batch_sampler,
+            n_obj=2,
+            xl=xl,
+            xu=xu,
+            device=device,
+            eval_mode=eval_mode,
+            eval_batches=eval_batches,
+        )
+        self.problem_name = "f1_l1"
+        self.metrics = F1L1Metrics(self)
+        self.moo_fitness = MOOFitness(self.metrics)
+        self.soo_fitness = SOOFitness(
+            self.metrics,
+            scalar_weights=default_scalar_weights(self.problem_name, self.n_obj),
+        )
+
+    def _evaluate_individual(self, flat: np.ndarray) -> np.ndarray:
+        return self.moo_fitness.evaluate_one(flat)
+
+
+class SoftF1L1Problem(WeightOptimizationProblem):
+    """Two-objective: soft macro-F1 and mean |θ| (``F = (1−soft F1, L1)``)."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        batch_sampler: BatchSampler,
+        xl: float = -10.0,
+        xu: float = 10.0,
+        device: torch.device | None = None,
+        eval_mode: str = "multi",
+        eval_batches: int = 50,
+        temperature: float = 1.0,
+    ) -> None:
+        super().__init__(
+            model=model,
+            batch_sampler=batch_sampler,
+            n_obj=2,
+            xl=xl,
+            xu=xu,
+            device=device,
+            eval_mode=eval_mode,
+            eval_batches=eval_batches,
+        )
+        self.temperature = float(temperature)
+        self.problem_name = "soft_f1_l1"
+        self.metrics = SoftF1L1Metrics(self, temperature=temperature)
+        self.moo_fitness = MOOFitness(self.metrics)
+        self.soo_fitness = SOOFitness(
+            self.metrics,
+            scalar_weights=default_scalar_weights(self.problem_name, self.n_obj),
+        )
+
+    def _evaluate_individual(self, flat: np.ndarray) -> np.ndarray:
+        return self.moo_fitness.evaluate_one(flat)
+
+
+DEFAULT_XL = -10.0
+DEFAULT_XU = 10.0
+
+
+def apply_scalar_weights(
+    problem: WeightOptimizationProblem,
+    weights_spec: str | list[float] | tuple[float, ...] | None,
+) -> np.ndarray:
+    """Set SOO weighted-sum weights on ``problem.soo_fitness``; return the weights used."""
+    soo = getattr(problem, "soo_fitness", None)
+    if soo is None:
+        raise ValueError(
+            f"Problem {type(problem).__name__} has no soo_fitness for scalarization."
+        )
+    name = getattr(problem, "problem_name", "")
+    w = parse_scalar_weights(weights_spec, int(problem.n_obj), problem_name=name)
+    soo.set_scalar_weights(w)
+    return w
+
+
 def build_problem(
     name: str,
     model: nn.Module,
     batch_sampler: BatchSampler,
     device: torch.device | None = None,
-    resample_every: int = 50,
-    eval_mode: str = "single",
-    eval_batches: int = 8,
+    eval_mode: str = "multi",
+    eval_batches: int = 50,
+    xl: float = DEFAULT_XL,
+    xu: float = DEFAULT_XU,
 ) -> WeightOptimizationProblem:
     name = PROBLEM_ALIASES.get(name.lower(), name.lower())
+    xl = float(xl)
+    xu = float(xu)
+    if not (xu > xl):
+        raise ValueError(f"Need xu > xl, got xl={xl}, xu={xu}")
     kwargs = dict(
         model=model,
         batch_sampler=batch_sampler,
         device=device,
-        resample_every=resample_every,
         eval_mode=eval_mode,
         eval_batches=eval_batches,
+        xl=xl,
+        xu=xu,
     )
     if name == "cwrm_cross_entropy":
         return CWRMCrossEntropyProblem(**kwargs)
@@ -364,9 +668,24 @@ def build_problem(
         return PrecisionRecallProblem(**kwargs)
     if name == "soft_precision_recall":
         return SoftPrecisionRecallProblem(**kwargs)
+    if name == "ce_soft_precision_recall":
+        return CESoftPrecisionRecallProblem(**kwargs)
     if name == "erm_cross_entropy":
         return ERMCrossEntropyProblem(**kwargs)
+    if name == "erm_f1":
+        return ERMF1Problem(**kwargs)
+    if name == "erm_soft_f1":
+        return ERMSoftF1Problem(**kwargs)
+    if name == "cross_entropy_l1":
+        return CrossEntropyL1Problem(**kwargs)
+    if name == "f1_l1":
+        return F1L1Problem(**kwargs)
+    if name == "soft_f1_l1":
+        return SoftF1L1Problem(**kwargs)
     raise ValueError(f"Unknown problem: {name!r}. Use one of {PROBLEMS}.")
+
+
+EVAL_SAMPLER_NAMES = ("auto", "random", "balanced")
 
 
 def build_eval_sampler(
@@ -375,13 +694,27 @@ def build_eval_sampler(
     batch_size: int,
     num_classes: int,
     seed: int | None = None,
+    sampler: str = "auto",
 ) -> BatchSampler:
-    """P/R and ERM–CE use random batches; CWRM–CE keeps class-guaranteed."""
-    problem_name = PROBLEM_ALIASES.get(problem_name.lower(), problem_name.lower())
-    if problem_name in PR_PROBLEMS or problem_name == "erm_cross_entropy":
-        return RandomBatchSampler(
-            dataset, batch_size=batch_size, num_classes=num_classes, seed=seed
+    """Build a ``RandomBatchSampler`` or ``ClassBalancedSampler``.
+
+    ``sampler="auto"``: CWRM–CE uses class-balanced batches; P/R, CE+soft-P/R,
+    task+L1, and ERM use uniform random batches.
+    """
+    name = str(sampler).lower()
+    if name not in EVAL_SAMPLER_NAMES:
+        raise ValueError(
+            f"Unknown sampler: {sampler!r}. Use one of {EVAL_SAMPLER_NAMES}."
         )
-    return ClassGuaranteedBatchSampler(
-        dataset, batch_size=batch_size, num_classes=num_classes, seed=seed
-    )
+    problem_name = PROBLEM_ALIASES.get(problem_name.lower(), problem_name.lower())
+    if name == "auto":
+        use_balanced = not (
+            problem_name in PR_PROBLEMS
+            or problem_name in CE_SOFT_PR_PROBLEMS
+            or problem_name in L1_PROBLEMS
+            or problem_name in SOO_ONLY_PROBLEMS
+        )
+    else:
+        use_balanced = name == "balanced"
+    cls = ClassBalancedSampler if use_balanced else RandomBatchSampler
+    return cls(dataset, batch_size=batch_size, num_classes=num_classes, seed=seed)

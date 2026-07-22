@@ -1,3 +1,14 @@
 """SOO algorithm name registry (evosax runners live in ``soo.es``)."""
 
-SOO_ALGORITHMS = ("cmaes", "snes", "xnes", "open_es")
+SOO_ALGORITHMS = (
+    "cmaes",
+    "snes",
+    "xnes",
+    "open_es",
+    "cr_fm_nes",
+    "asebo",
+    "lm_ma_es",
+    "de",
+    "jde",
+    "pso",
+)

@@ -2,10 +2,23 @@
 
 from __future__ import annotations
 
+import ssl
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset, Subset
 from torchvision import datasets, transforms
+
+# macOS / Homebrew Python often lacks system CA certs; torchvision downloads fail
+# with CERTIFICATE_VERIFY_FAILED unless the default HTTPS context uses certifi.
+try:
+    import certifi
+
+    ssl._create_default_https_context = lambda: ssl.create_default_context(
+        cafile=certifi.where()
+    )
+except ImportError:
+    pass
 
 
 DATASETS = ("mnist", "mnist_2cls", "cifar10")
@@ -64,7 +77,7 @@ def _labels_of(dataset: Dataset) -> np.ndarray:
     return np.asarray([int(dataset[i][1]) for i in range(len(dataset))])
 
 
-EVAL_MODES = ("single", "multi")
+EVAL_MODES = ("single", "multi")  # pool size per generation; sampler draws each gen
 
 
 def _materialize_batch(
@@ -80,10 +93,10 @@ def _materialize_batch(
 
 
 class RandomBatchSampler:
-    """Sample random mini-batches without class balancing.
+    """Sample mini-batches uniformly at random (PyTorch ``RandomSampler`` style).
 
-    Intended for precision/recall fitness where metrics are computed on the
-    pooled predictions across one or more batches (not per mini-batch).
+    Draws ``batch_size`` indices without replacement. Intended for metrics
+    computed on pooled predictions across one or more batches.
     """
 
     def __init__(
@@ -115,8 +128,8 @@ class RandomBatchSampler:
         return [self.sample_batch() for _ in range(max(1, int(n_batches)))]
 
 
-class ClassGuaranteedBatchSampler:
-    """Sample batches of size ``batch_size`` where every class appears at least once.
+class ClassBalancedSampler:
+    """Sample batches that try to include every class at least once.
 
     With ``num_classes=10`` and ``batch_size=32``, each batch contains one
     mandatory sample per class, then the remaining 22 slots are filled

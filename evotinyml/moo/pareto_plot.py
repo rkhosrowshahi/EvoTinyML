@@ -48,6 +48,8 @@ def figure_precision_recall_front(
     step: int,
     history: Sequence[tuple[int, np.ndarray, np.ndarray]] | None = None,
     title_prefix: str = "Train",
+    highlight: np.ndarray | None = None,
+    highlight_label: str = "center",
 ) -> Figure:
     """2D precision–recall ND front (matches the usual P–R scatter style)."""
     p = np.asarray(precision, dtype=float).ravel()
@@ -93,6 +95,23 @@ def figure_precision_recall_front(
             label=f"knee (P={p[knee]:.3f}, R={r[knee]:.3f})",
         )
 
+    if highlight is not None:
+        # ``highlight`` is in minimization space F=(1−P, 1−R).
+        h = np.asarray(highlight, dtype=float).ravel()
+        if h.size >= 2:
+            hp, hr = float(1.0 - h[0]), float(1.0 - h[1])
+            ax.scatter(
+                [hp],
+                [hr],
+                s=140,
+                marker="*",
+                c="tab:orange",
+                edgecolors="black",
+                linewidths=0.6,
+                zorder=6,
+                label=f"{highlight_label} (P={hp:.3f}, R={hr:.3f})",
+            )
+
     ax.set_xlim(0.0, 1.0)
     ax.set_ylim(0.0, 1.0)
     ax.set_xlabel("macro precision")
@@ -111,6 +130,8 @@ def figure_objective_front_2d(
     x_label: str = "f1",
     y_label: str = "f2",
     title_prefix: str = "Train",
+    highlight: np.ndarray | None = None,
+    highlight_label: str = "center",
 ) -> Figure:
     """Generic 2-objective minimization scatter of the ND front."""
     F = np.asarray(F, dtype=float)
@@ -135,6 +156,20 @@ def figure_objective_front_2d(
             zorder=5,
             label=f"knee ({F[knee, 0]:.3f}, {F[knee, 1]:.3f})",
         )
+    if highlight is not None:
+        h = np.asarray(highlight, dtype=float).ravel()
+        if h.size >= 2:
+            ax.scatter(
+                [h[0]],
+                [h[1]],
+                s=140,
+                marker="*",
+                c="tab:orange",
+                edgecolors="black",
+                linewidths=0.6,
+                zorder=6,
+                label=f"{highlight_label} ({h[0]:.3f}, {h[1]:.3f})",
+            )
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
     ax.set_title(f"{title_prefix} Pareto front (step {int(step)})")
@@ -446,6 +481,8 @@ def pareto_front_images(
             step=step,
             history=history,
             title_prefix=key_prefix.capitalize(),
+            highlight=highlight,
+            highlight_label=highlight_label,
         )
         return {f"{key_prefix}/pareto_front": figure_to_wandb_image(fig)}
 
@@ -457,6 +494,8 @@ def pareto_front_images(
             x_label=labels[0],
             y_label=labels[1],
             title_prefix=key_prefix.capitalize(),
+            highlight=highlight,
+            highlight_label=highlight_label,
         )
         return {f"{key_prefix}/pareto_front": figure_to_wandb_image(fig)}
 

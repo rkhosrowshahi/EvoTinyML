@@ -1,14 +1,16 @@
 """Multi-objective OpenES variants over vector-valued problems (e.g. CWRM-CE).
 
-Two algorithms, both reusing the OpenES machinery (antithetic Gaussian
-sampling, centered-rank shaping, Optax mean update):
+Search math (antithetic sampling, fitness shaping, MGDA / UPGrad,
+Tchebycheff / weighted-sum, Optax mean update) is JAX + evosax; fitness
+evaluation stays PyTorch; the non-dominated archive stays NumPy/pymoo.
 
-- ``mgda_open_es`` (Design A): a single mean. Per-objective ES gradients are
-  estimated from the *same* population sample (one forward pass yields the
-  full objective vector), then combined into a common descent direction with
-  MGDA (min-norm point in the convex hull of the gradients; Desideri 2012).
-  Converges to one Pareto-stationary solution; every evaluated candidate is
-  pushed into a non-dominated archive so a front is still reported.
+- ``mgda_open_es`` / ``upgrad_open_es`` (Design A): a single mean. Per-objective
+  ES gradients are estimated from the *same* population sample, then combined
+  into one descent direction by either MGDA (min-norm in the convex hull;
+  Desideri 2012 / Sener & Koltun) or UPGrad (unconflicting projection onto the
+  dual cone of the Jacobian rows, then average; Jacobian Descent,
+  arXiv:2406.16232). Converges toward a Pareto-stationary compromise; all
+  candidates feed a non-dominated archive.
 
 - ``moead_open_es`` (Design B): K means, each paired with a weight vector on
   the objective simplex (MOEA/D decomposition; Zhang & Li 2007). Each mean
@@ -32,12 +34,19 @@ from torch.utils.data import DataLoader
 
 from evotinyml.moo.algorithms import make_reference_directions
 from evotinyml.moo.display import _hv_unit_front, _normalize_by_nadir
-from evotinyml.moo.pareto_plot import (
-    class_obj_labels,
-    pareto_front_images,
-    val_class_pareto_images,
+from evotinyml.moo.pareto_plot import pareto_front_images, val_class_pareto_images
+from evotinyml.fitness import (
+    L1_HV_REF,
+    l1_problem_metric_log_dict,
+    l1_val_front,
+    mean_abs_weights,
 )
-from evotinyml.problem import CE_PROBLEMS, WeightOptimizationProblem
+from evotinyml.problem import (
+    CE_PROBLEMS,
+    L1_PROBLEMS,
+    WeightOptimizationProblem,
+    problem_obj_labels,
+)
 from evotinyml.soo.es import (
     DEFAULT_ES_OPTIM,
     DEFAULT_ES_OPTIM_LR,
@@ -59,8 +68,35 @@ from evotinyml.validation import (
 )
 from evotinyml.wandb_logger import log_metrics
 
-MO_ES_ALGORITHMS = ("mgda_open_es", "moead_open_es")
+MO_ES_ALGORITHMS = ("mgda_open_es", "upgrad_open_es", "moead_open_es")
+# Design-A aggregators: combine per-objective ES grads into one mean update.
+MO_AGGREGATORS = ("mgda", "upgrad")
+DEFAULT_MO_AGGREGATOR = "mgda"
 ARCHIVE_SELECTIONS = ("nsga2", "nsga3")
+# Per-objective ES-gradient rescaling before MGDA / UPGrad (Sener & Koltun style).
+# ``l2``: g <- g/||g||. ``loss`` / ``loss+`` need current objective values and
+# are unsafe when an objective is near 0 (e.g. L1 with --init zeros).
+# ``range``: MGDA weights from l2-normalized grads are further multiplied by
+# each objective's range-normalized distance to its ideal (F_c / running
+# nadir_c, ideal = 0). Rank shaping makes ES gradients scale-invariant, so
+# this re-injects the magnitude information ranks destroy: a converged
+# objective (e.g. L1 = 0 at --init zeros) loses its pull instead of vetoing
+# progress on the others.
+MGDA_NORMALIZATIONS = ("none", "l2", "loss", "loss+", "range")
+DEFAULT_MGDA_NORMALIZE = "none"
+# Per-objective ES fitness shaping for the MGDA gradient estimate.
+# ``centered_ranks``: OpenES default; robust to outliers but stretches any
+# ordering (even pure batch noise) to full [-0.5, 0.5] spread and discards
+# within-population magnitudes, so a noise-dominated objective yields a
+# gradient with the same norm as an informative one.
+# ``z_score``: (F - mean) / std per objective; keeps relative magnitudes
+# within the population (a 3-sigma-better candidate contributes 3x) while
+# staying scale-normalized across objectives.
+# ``raw``: F - mean; the plain ES gradient estimate with true per-objective
+# scale (a flat/noisy objective yields a small-norm gradient), but sensitive
+# to outliers (e.g. one exploded CE candidate).
+ES_FITNESS_SHAPINGS = ("centered_ranks", "z_score", "raw")
+DEFAULT_ES_FITNESS_SHAPING = "centered_ranks"
 
 DEFAULT_ARCHIVE_SIZE = 100
 DEFAULT_MOEAD_K = 10
@@ -91,23 +127,84 @@ _SENTINEL_F = 1e5
 
 
 # ---------------------------------------------------------------------------
-# Shared ES pieces
+# Shared ES / MO math (JAX + evosax); NumPy wrappers for archive / callers
 # ---------------------------------------------------------------------------
 
 
-def _centered_ranks(values: np.ndarray) -> np.ndarray:
-    """Map values to ranks in [-0.5, 0.5] (largest value -> +0.5)."""
-    n = len(values)
-    ranks = np.empty(n, dtype=np.float64)
-    ranks[np.argsort(values)] = np.arange(n, dtype=np.float64)
-    if n > 1:
-        ranks /= n - 1
-    return ranks - 0.5
+def _jnp():
+    import jax.numpy as jnp
+
+    return jnp
 
 
-def _antithetic_noise(rng: np.random.Generator, half: int, n_var: int) -> np.ndarray:
-    eps = rng.standard_normal(size=(half, n_var))
-    return np.concatenate([eps, -eps], axis=0)
+def _centered_ranks(values):
+    """Centered ranks in [-0.5, 0.5] via evosax (average ties). Returns JAX array."""
+    from evosax.core.fitness_shaping import centered_rank_fitness_shaping_fn
+
+    jnp = _jnp()
+    x = jnp.asarray(values).ravel()
+    n = int(x.shape[0])
+    if n <= 1:
+        return jnp.zeros((n,))
+    return centered_rank_fitness_shaping_fn(None, x, None, None)
+
+
+def _shape_objective(values, mode: str):
+    """Map one objective / scalar fitness column to ES utilities (JAX)."""
+    from evosax.core.fitness_shaping import (
+        centered_rank_fitness_shaping_fn,
+        standardize_fitness_shaping_fn,
+    )
+
+    jnp = _jnp()
+    x = jnp.asarray(values).ravel()
+    n = int(x.shape[0])
+    if n == 0:
+        return x
+    if mode == "centered_ranks":
+        if n <= 1:
+            return jnp.zeros((n,))
+        return centered_rank_fitness_shaping_fn(None, x, None, None)
+    if mode == "z_score":
+        if n <= 1:
+            return jnp.zeros((n,))
+        return standardize_fitness_shaping_fn(None, x, None, None)
+    # raw: centered fitness (keeps per-objective scale)
+    return x - jnp.mean(x)
+
+
+def _shape_objectives(F, mode: str):
+    """Shape each column of ``F`` (n_pop, n_obj) -> utilities (n_pop, n_obj)."""
+    jnp = _jnp()
+    F = jnp.asarray(F)
+    cols = [_shape_objective(F[:, c], mode) for c in range(int(F.shape[1]))]
+    return jnp.column_stack(cols)
+
+
+def _antithetic_noise(key, half: int, n_var: int):
+    """Split ``key``; return ``(new_key, eps)`` with antithetic Gaussian rows."""
+    import jax
+
+    jnp = _jnp()
+    key, sub = jax.random.split(key)
+    eps = jax.random.normal(sub, (half, n_var))
+    return key, jnp.concatenate([eps, -eps], axis=0)
+
+
+def _es_gradient(utilities, eps_eff, sigma: float):
+    """OpenES gradient ``(u @ eps_eff) / (n σ)``; ``utilities`` shape (n,)."""
+    jnp = _jnp()
+    u = jnp.asarray(utilities).ravel()
+    n = u.shape[0]
+    return (u @ eps_eff) / (n * sigma)
+
+
+def _es_gradients_multi(U, eps_eff, sigma: float):
+    """Per-objective OpenES grads; ``U`` is (n_pop, n_obj) -> ``G`` (n_obj, n_var)."""
+    jnp = _jnp()
+    U = jnp.asarray(U)
+    n = U.shape[0]
+    return (U.T @ eps_eff) / (n * sigma)
 
 
 def _evaluate_F(problem: WeightOptimizationProblem, X: np.ndarray) -> np.ndarray:
@@ -122,7 +219,7 @@ def _evaluate_F(problem: WeightOptimizationProblem, X: np.ndarray) -> np.ndarray
         raise RuntimeError(
             "Sentinel objective value detected (a class is absent from the eval "
             "pool). Rank shaping / Tchebycheff would be corrupted; use a "
-            "class-guaranteed sampler or a larger --batch-size."
+            "class-balanced sampler or a larger --batch-size."
         )
     return F
 
@@ -157,7 +254,7 @@ class _MeanOptimizer:
         self.mean = np.clip(np.asarray(mean0, dtype=np.float64), self.xl, self.xu)
         self._opt_state = self._optimizer.init(jnp.asarray(self.mean, dtype=jnp.float32))
 
-    def step(self, grad: np.ndarray) -> np.ndarray:
+    def step(self, grad) -> np.ndarray:
         """Apply one Optax update along ``grad`` (ascent on grad -> we pass +grad
         of the loss so Optax's negative step descends). Returns the new mean."""
         import optax
@@ -179,8 +276,86 @@ class _MeanOptimizer:
 
 
 # ---------------------------------------------------------------------------
-# MGDA (min-norm point in the convex hull of gradients)
+# MGDA (min-norm point in the convex hull of gradients) — JAX
 # ---------------------------------------------------------------------------
+
+
+def _normalize_mgda_gradients(
+    G,
+    *,
+    mode: str = DEFAULT_MGDA_NORMALIZE,
+    losses=None,
+    eps: float = 1e-8,
+):
+    """Rescale per-objective gradient rows before MGDA (JAX arrays)."""
+    jnp = _jnp()
+    mode = mode.lower()
+    if mode not in MGDA_NORMALIZATIONS:
+        raise ValueError(
+            f"Unknown MGDA normalize mode: {mode!r}. Use one of {MGDA_NORMALIZATIONS}."
+        )
+    G = jnp.asarray(G)
+    if mode == "none":
+        return G
+
+    norms = jnp.linalg.norm(G, axis=1)
+    if mode in ("loss", "loss+"):
+        if losses is None:
+            raise ValueError(f"MGDA normalize mode {mode!r} requires losses.")
+        L = jnp.maximum(jnp.asarray(losses).ravel(), eps)
+        if int(L.shape[0]) != int(G.shape[0]):
+            raise ValueError(
+                f"losses length {int(L.shape[0])} != n_obj={int(G.shape[0])} "
+                "for MGDA normalize."
+            )
+    else:
+        L = None
+
+    scales = jnp.ones(G.shape[0])
+    if mode in ("l2", "loss+"):
+        scales = scales * jnp.maximum(norms, eps)
+    if mode in ("loss", "loss+"):
+        scales = scales * L
+    return G / scales[:, None]
+
+
+def _mgda_weights(G, max_iter: int = 250, tol: float = 1e-12):
+    """Frank-Wolfe solve of ``min_w ||w^T G||^2`` over the simplex (JAX)."""
+    jnp = _jnp()
+    G = jnp.asarray(G)
+    M = G @ G.T
+    n_obj = int(M.shape[0])
+    w = jnp.full((n_obj,), 1.0 / n_obj)
+    for _ in range(max_iter):
+        t = int(jnp.argmin(M @ w))
+        e_t = jnp.zeros((n_obj,)).at[t].set(1.0)
+        diff = e_t - w
+        denom = diff @ M @ diff
+        if float(denom) <= tol:
+            break
+        gamma = jnp.clip(-(w @ M @ diff) / denom, 0.0, 1.0)
+        if float(gamma) <= tol:
+            break
+        w = w + gamma * diff
+    return w
+
+
+def normalize_mgda_gradients(
+    G: np.ndarray,
+    *,
+    mode: str = DEFAULT_MGDA_NORMALIZE,
+    losses: np.ndarray | None = None,
+    eps: float = 1e-8,
+) -> np.ndarray:
+    """Rescale per-objective gradient rows before MGDA (Sener & Koltun).
+
+    ``G`` is ``(n_obj, n_var)``. Modes match their ``gradient_normalizers``:
+    ``none``, ``l2`` (``g/||g||``), ``loss`` (``g/L``), ``loss+`` (``g/(L·||g||)``).
+    """
+    return np.asarray(
+        _normalize_mgda_gradients(G, mode=mode, losses=losses, eps=eps),
+        dtype=np.float64,
+    )
 
 
 def mgda_weights(G: np.ndarray, max_iter: int = 250, tol: float = 1e-12) -> np.ndarray:
@@ -188,25 +363,119 @@ def mgda_weights(G: np.ndarray, max_iter: int = 250, tol: float = 1e-12) -> np.n
 
     ``G`` is (n_obj, n_var). Returns convex weights ``w`` (n_obj,).
     """
-    M = G @ G.T
-    n_obj = M.shape[0]
-    w = np.full(n_obj, 1.0 / n_obj, dtype=np.float64)
-    for _ in range(max_iter):
-        t = int(np.argmin(M @ w))
-        diff = -w.copy()
-        diff[t] += 1.0  # e_t - w
-        denom = float(diff @ M @ diff)
-        if denom <= tol:
-            break
-        gamma = float(np.clip(-(w @ M @ diff) / denom, 0.0, 1.0))
-        if gamma <= tol:
-            break
-        w = w + gamma * diff
-    return w
+    return np.asarray(_mgda_weights(G, max_iter=max_iter, tol=tol), dtype=np.float64)
 
 
 # ---------------------------------------------------------------------------
-# Tchebycheff scalarization (MOEA/D)
+# UPGrad (unconflicting projection onto the dual cone) — NumPy / SciPy
+# ---------------------------------------------------------------------------
+
+
+def _dual_cone_qp_weights(M: np.ndarray, u: np.ndarray, eps: float = 1e-10) -> np.ndarray:
+    """Solve ``min_v v^T M v`` s.t. ``v >= u`` (UPGrad dual, Prop. 1)."""
+    from scipy.optimize import minimize
+
+    m = int(M.shape[0])
+    M = 0.5 * (M + M.T) + eps * np.eye(m)
+    u = np.asarray(u, dtype=np.float64).ravel()
+
+    def fun(v: np.ndarray) -> float:
+        return float(v @ M @ v)
+
+    def jac(v: np.ndarray) -> np.ndarray:
+        return 2.0 * (M @ v)
+
+    bounds = [(float(u[i]), None) for i in range(m)]
+    v0 = np.maximum(u, 0.0)
+    # Feasible start slightly above the bound helps L-BFGS-B.
+    v0 = v0 + 0.1 * (np.abs(v0) + 1.0)
+    res = minimize(
+        fun,
+        v0,
+        jac=jac,
+        method="L-BFGS-B",
+        bounds=bounds,
+        options={"ftol": 1e-14, "gtol": 1e-10, "maxiter": 500},
+    )
+    return np.asarray(res.x, dtype=np.float64)
+
+
+def _upgrad_aggregate(G, eps: float = 1e-10):
+    """UPGrad aggregator (Jacobian Descent): project each row onto the dual cone, average.
+
+    ``G`` is ``(n_obj, n_var)``. Returns ``(direction, w_bar)`` where
+    ``direction = w_bar @ G`` lies in the dual cone of the rows of ``G``
+    (``G @ direction >= 0`` up to numerics), and ``w_bar`` is the average of
+    the dual QP solutions for ``u = e_i``.
+    """
+    G_np = np.asarray(G, dtype=np.float64)
+    m = int(G_np.shape[0])
+    if m == 0:
+        raise ValueError("UPGrad needs at least one objective gradient row.")
+    M = G_np @ G_np.T
+    w_sum = np.zeros(m, dtype=np.float64)
+    for i in range(m):
+        u = np.zeros(m, dtype=np.float64)
+        u[i] = 1.0
+        w_sum += _dual_cone_qp_weights(M, u, eps=eps)
+    w_bar = w_sum / m
+    direction = w_bar @ G_np
+    return direction, w_bar
+
+
+def upgrad_aggregate(G: np.ndarray, eps: float = 1e-10) -> np.ndarray:
+    """UPGrad direction for per-objective gradients ``G`` (n_obj, n_var)."""
+    direction, _ = _upgrad_aggregate(G, eps=eps)
+    return np.asarray(direction, dtype=np.float64)
+
+
+def aggregate_mo_gradients(
+    G,
+    *,
+    aggregator: str = DEFAULT_MO_AGGREGATOR,
+    normalize: str = DEFAULT_MGDA_NORMALIZE,
+    losses=None,
+):
+    """Combine per-objective ES grads into one descent direction.
+
+    Returns ``(direction, weights_or_dual, info)``.
+    For ``mgda``, ``weights`` are simplex weights and ``direction = w @ G_raw``
+    (weights from optionally normalized grads). For ``upgrad``, ``direction`` is
+    the UPGrad aggregate of the (optionally normalized) Jacobian and
+    ``weights`` are the averaged dual QP coefficients.
+    """
+    jnp = _jnp()
+    aggregator = aggregator.lower()
+    if aggregator not in MO_AGGREGATORS:
+        raise ValueError(
+            f"Unknown mo aggregator: {aggregator!r}. Use one of {MO_AGGREGATORS}."
+        )
+    normalize = normalize.lower()
+    G_raw = jnp.asarray(G)
+    info: dict[str, float] = {}
+
+    if aggregator == "mgda":
+        if normalize == "range":
+            w = _mgda_weights(_normalize_mgda_gradients(G_raw, mode="l2"))
+            # range modulation applied by caller (needs running nadir / mean_F)
+            direction = w @ G_raw
+            return direction, w, info
+        G_mgda = _normalize_mgda_gradients(G_raw, mode=normalize, losses=losses)
+        w = _mgda_weights(G_mgda)
+        direction = w @ G_raw
+        return direction, w, info
+
+    # UPGrad: ``range`` falls back to l2 geometry (no simplex weights to rescale).
+    norm_mode = "l2" if normalize == "range" else normalize
+    if normalize == "range":
+        info["upgrad_range_fallback"] = 1.0
+    G_use = _normalize_mgda_gradients(G_raw, mode=norm_mode, losses=losses)
+    direction_np, w_bar = _upgrad_aggregate(np.asarray(G_use))
+    return jnp.asarray(direction_np), jnp.asarray(w_bar), info
+
+
+# ---------------------------------------------------------------------------
+# Tchebycheff scalarization (MOEA/D) — JAX core, NumPy wrappers
 # ---------------------------------------------------------------------------
 
 
@@ -236,19 +505,48 @@ def moead_weight_vectors(
     return W[chosen]
 
 
+def _tchebycheff(F, lam, ideal, rho: float = DEFAULT_MOEAD_RHO):
+    """Augmented Tchebycheff (JAX)."""
+    jnp = _jnp()
+    diff = jnp.asarray(F) - jnp.asarray(ideal)
+    if diff.ndim == 1:
+        diff = diff[None, :]
+    weighted = jnp.asarray(lam) * diff
+    return weighted.max(axis=1) + rho * weighted.sum(axis=1)
+
+
+def _weighted_sum(F, lam, ideal):
+    """Weighted-sum scalarization (JAX)."""
+    jnp = _jnp()
+    diff = jnp.asarray(F) - jnp.asarray(ideal)
+    if diff.ndim == 1:
+        diff = diff[None, :]
+    return (jnp.asarray(lam) * diff).sum(axis=1)
+
+
+def _scalarize(
+    F,
+    lam,
+    ideal,
+    *,
+    method: str = DEFAULT_MOEAD_SCALARIZATION,
+    rho: float = DEFAULT_MOEAD_RHO,
+):
+    if method == "weighted_sum":
+        return _weighted_sum(F, lam, ideal)
+    return _tchebycheff(F, lam, ideal, rho)
+
+
 def tchebycheff(
     F: np.ndarray, lam: np.ndarray, ideal: np.ndarray, rho: float = DEFAULT_MOEAD_RHO
 ) -> np.ndarray:
     """Augmented Tchebycheff ``max_c lam_c (F_c - z_c) + rho * sum_c lam_c (F_c - z_c)``."""
-    diff = np.asarray(F, dtype=np.float64) - ideal[None, :]
-    weighted = lam[None, :] * diff
-    return weighted.max(axis=1) + rho * weighted.sum(axis=1)
+    return np.asarray(_tchebycheff(F, lam, ideal, rho), dtype=np.float64)
 
 
 def weighted_sum(F: np.ndarray, lam: np.ndarray, ideal: np.ndarray) -> np.ndarray:
     """Weighted-sum scalarization ``sum_c lam_c (F_c - z_c)``."""
-    diff = np.asarray(F, dtype=np.float64) - ideal[None, :]
-    return (lam[None, :] * diff).sum(axis=1)
+    return np.asarray(_weighted_sum(F, lam, ideal), dtype=np.float64)
 
 
 def scalarize(
@@ -259,9 +557,9 @@ def scalarize(
     method: str = DEFAULT_MOEAD_SCALARIZATION,
     rho: float = DEFAULT_MOEAD_RHO,
 ) -> np.ndarray:
-    if method == "weighted_sum":
-        return weighted_sum(F, lam, ideal)
-    return tchebycheff(F, lam, ideal, rho)
+    return np.asarray(
+        _scalarize(F, lam, ideal, method=method, rho=rho), dtype=np.float64
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +691,11 @@ class _RunLogger:
     def ensure_hv_anchors(self, F: np.ndarray) -> None:
         if self.nadir is not None:
             return
+        problem_name = getattr(self.problem, "problem_name", "")
+        if problem_name in L1_PROBLEMS:
+            self.nadir = L1_HV_REF.copy()
+            print("HV: L1 problems use fixed ref = [1.0, 1.0] (no nadir scaling)")
+            return
         self.problem.set_hv_anchors_from_F(F)
         self.nadir = np.asarray(self.problem.hv_nadir, dtype=np.float64)
         print(
@@ -404,9 +707,12 @@ class _RunLogger:
     def archive_hv(self) -> float:
         if self.nadir is None or len(self.archive) == 0:
             return 0.0
-        F_norm = _normalize_by_nadir(self.archive.F, self.nadir)
+        F_use = np.asarray(self.archive.F, dtype=float)
+        problem_name = getattr(self.problem, "problem_name", "")
+        if problem_name not in L1_PROBLEMS:
+            F_use = _normalize_by_nadir(F_use, self.nadir)
         return _hv_unit_front(
-            F_norm,
+            F_use,
             n_obj=self.problem.n_obj,
             hv_exact=None,
             hv_samples=self.hv_samples,
@@ -447,6 +753,17 @@ class _RunLogger:
                 if report_x is not None and "center_f" in extra:
                     metrics["train/f"] = float(extra["center_f"])
                     metrics["train/mean_f"] = float(extra["center_f"])
+        problem_name = getattr(self.problem, "problem_name", "")
+        if problem_name in L1_PROBLEMS:
+            F_rep = report_F
+            if F_rep is None and len(self.archive):
+                knee_i = int(np.argmin(np.sum(np.square(self.archive.F), axis=1)))
+                F_rep = self.archive.F[knee_i]
+            if F_rep is not None:
+                metrics.update(l1_problem_metric_log_dict("train", problem_name, F_rep))
+                if report_x is not None and "center_f" in extra:
+                    metrics["train/f"] = float(extra["center_f"])
+                    metrics["train/mean_f"] = float(extra["center_f"])
         if self.verbose:
             extra_str = "  ".join(
                 f"{k}={v:.6f}" for k, v in extra.items() if not str(k).startswith("class_")
@@ -459,10 +776,9 @@ class _RunLogger:
             if len(self.archive) > 0 and (
                 step == 0 or step == 1 or step % self.pareto_every == 0
             ):
-                labels = (
-                    class_obj_labels(self.archive.F.shape[1])
-                    if getattr(self.problem, "problem_name", "") in CE_PROBLEMS
-                    else None
+                labels = problem_obj_labels(
+                    getattr(self.problem, "problem_name", ""),
+                    self.archive.F.shape[1],
                 )
                 highlight = None
                 if report_F is not None:
@@ -499,23 +815,14 @@ class _RunLogger:
         metrics: dict[str, Any] = {"train/step": int(step)}
         msg_parts: list[str] = [f"[step {step}]"]
 
+        problem_name = getattr(self.problem, "problem_name", "")
+        is_l1 = problem_name in L1_PROBLEMS
+        result = None
+        knee_i = 0
+
         if len(self.archive) > 0:
             result = validate_nd_set(
                 self.problem, self.archive.X, self.test_loader, self.n_classes
-            )
-            hv_acc = _hv_unit_front(
-                result.error_acc,
-                n_obj=self.n_classes,
-                hv_exact=None,
-                hv_samples=self.hv_samples,
-                hv_seed=self.hv_seed,
-            )
-            hv_f1 = _hv_unit_front(
-                result.error_f1,
-                n_obj=self.n_classes,
-                hv_exact=None,
-                hv_samples=self.hv_samples,
-                hv_seed=self.hv_seed,
             )
             metrics.update(
                 {
@@ -524,30 +831,89 @@ class _RunLogger:
                     "val/f1_best": float(result.best_f1),
                     "val/mean_acc": float(result.mean_acc),
                     "val/mean_f1": float(result.mean_f1),
-                    "val/hv_acc": float(hv_acc),
-                    "val/hv_f1": float(hv_f1),
                 }
             )
-            # Archive knee (diagnostic); primary report prefers the center below.
-            knee_i = int(np.argmin(np.sum(np.square(result.per_class_ce), axis=1)))
-            metrics["val/knee_acc"] = float(result.overall_acc[knee_i])
-            metrics["val/knee_f1"] = float(result.macro_f1[knee_i])
-            msg_parts.append(
-                f"test ND (n={len(self.archive)}): "
-                f"acc_best={result.best_acc:.4f}  f1_best={result.best_f1:.4f}  "
-                f"knee_acc={metrics['val/knee_acc']:.4f}  "
-                f"mean_acc={result.mean_acc:.4f}  HV_acc={hv_acc:.6f}"
-            )
-            if self.use_wandb and (
-                force or step == 1 or step % self.pareto_every == 0
-            ):
-                metrics.update(
-                    val_class_pareto_images(
-                        result.per_class_ce,
-                        result.per_class_acc,
-                        step=step,
-                    )
+            if is_l1:
+                F_val = l1_val_front(
+                    problem_name,
+                    self.archive.X,
+                    mean_ce=result.mean_ce,
+                    macro_f1=result.macro_f1,
                 )
+                hv_l1 = _hv_unit_front(
+                    F_val,
+                    n_obj=2,
+                    hv_exact=None,
+                    hv_samples=self.hv_samples,
+                    hv_seed=self.hv_seed,
+                )
+                knee_i = int(np.argmin(np.sum(np.square(F_val), axis=1)))
+                metrics["val/hv"] = float(hv_l1)
+                metrics["val/knee_acc"] = float(result.overall_acc[knee_i])
+                metrics["val/knee_f1"] = float(result.macro_f1[knee_i])
+                metrics["val/knee_l1"] = float(F_val[knee_i, 1])
+                metrics.update(
+                    l1_problem_metric_log_dict("val", problem_name, F_val[knee_i])
+                )
+                msg_parts.append(
+                    f"test ND (n={len(self.archive)}): "
+                    f"acc_best={result.best_acc:.4f}  f1_best={result.best_f1:.4f}  "
+                    f"knee_acc={metrics['val/knee_acc']:.4f}  "
+                    f"knee_l1={metrics['val/knee_l1']:.6f}  "
+                    f"mean_acc={result.mean_acc:.4f}  HV={hv_l1:.6f}"
+                )
+                if self.use_wandb and (
+                    force or step == 1 or step % self.pareto_every == 0
+                ):
+                    labels = problem_obj_labels(problem_name, 2)
+                    metrics.update(
+                        pareto_front_images(
+                            F_val,
+                            problem_name=problem_name,
+                            step=step,
+                            key_prefix="val",
+                            highlight=np.mean(F_val, axis=0),
+                            highlight_label="center",
+                            obj_labels=labels,
+                        )
+                    )
+            else:
+                hv_acc = _hv_unit_front(
+                    result.error_acc,
+                    n_obj=self.n_classes,
+                    hv_exact=None,
+                    hv_samples=self.hv_samples,
+                    hv_seed=self.hv_seed,
+                )
+                hv_f1 = _hv_unit_front(
+                    result.error_f1,
+                    n_obj=self.n_classes,
+                    hv_exact=None,
+                    hv_samples=self.hv_samples,
+                    hv_seed=self.hv_seed,
+                )
+                metrics["val/hv_acc"] = float(hv_acc)
+                metrics["val/hv_f1"] = float(hv_f1)
+                # Archive knee (diagnostic); primary report prefers the center below.
+                knee_i = int(np.argmin(np.sum(np.square(result.per_class_ce), axis=1)))
+                metrics["val/knee_acc"] = float(result.overall_acc[knee_i])
+                metrics["val/knee_f1"] = float(result.macro_f1[knee_i])
+                msg_parts.append(
+                    f"test ND (n={len(self.archive)}): "
+                    f"acc_best={result.best_acc:.4f}  f1_best={result.best_f1:.4f}  "
+                    f"knee_acc={metrics['val/knee_acc']:.4f}  "
+                    f"mean_acc={result.mean_acc:.4f}  HV_acc={hv_acc:.6f}"
+                )
+                if self.use_wandb and (
+                    force or step == 1 or step % self.pareto_every == 0
+                ):
+                    metrics.update(
+                        val_class_pareto_images(
+                            result.per_class_ce,
+                            result.per_class_acc,
+                            step=step,
+                        )
+                    )
 
         if center is not None:
             acc, f1, prec, rec, _, _ = evaluate_weights_on_loader(
@@ -558,17 +924,27 @@ class _RunLogger:
             metrics["val/f1"] = float(f1)
             metrics["val/center_acc"] = float(acc)
             metrics["val/center_f1"] = float(f1)
-            if getattr(self.problem, "problem_name", "") in CE_PROBLEMS:
+            if problem_name in CE_PROBLEMS:
                 acc_c, ce_c = per_class_acc_ce_on_loader(
                     self.problem, center, self.test_loader, self.n_classes
                 )
                 metrics.update(class_metric_log_dict("val", acc_c, ce_c))
-            msg_parts.append(f"center_acc={acc:.4f}  center_f1={f1:.4f}")
-        elif len(self.archive) > 0:
+            if is_l1:
+                # L1 is a weight-norm objective; identical on train/val.
+                center_l1 = mean_abs_weights(center)
+                metrics["val/l1"] = float(center_l1)
+                metrics["val/center_l1"] = float(center_l1)
+                msg_parts.append(
+                    f"center_acc={acc:.4f}  center_f1={f1:.4f}  "
+                    f"center_l1={center_l1:.6f}"
+                )
+            else:
+                msg_parts.append(f"center_acc={acc:.4f}  center_f1={f1:.4f}")
+        elif result is not None:
             # No center: fall back to archive knee for primary val/* keys.
             metrics["val/acc"] = float(metrics["val/knee_acc"])
             metrics["val/f1"] = float(metrics["val/knee_f1"])
-            if getattr(self.problem, "problem_name", "") in CE_PROBLEMS:
+            if problem_name in CE_PROBLEMS:
                 metrics.update(
                     class_metric_log_dict(
                         "val",
@@ -576,6 +952,8 @@ class _RunLogger:
                         result.per_class_ce[knee_i],
                     )
                 )
+            if is_l1:
+                msg_parts.append(f"knee_l1={metrics['val/knee_l1']:.6f}")
 
         msg = "  ".join(msg_parts)
         print(msg)
@@ -587,24 +965,6 @@ class _RunLogger:
         if self.use_wandb:
             log_metrics(metrics, n_eval=n_eval)
 
-
-def _maybe_resample(
-    problem: WeightOptimizationProblem,
-    *,
-    gen: int,
-    steps: int,
-    resample_every: int,
-) -> bool:
-    if resample_every <= 0 or gen % resample_every != 0 or gen >= steps:
-        return False
-    problem.resample_batch()
-    n_batches = len(getattr(problem, "eval_batch_pool", []) or [])
-    print(
-        f"[step {gen}] resampled eval pool "
-        f"(batches={n_batches}, mode={getattr(problem, 'eval_mode', '?')}, "
-        f"batch_version={problem.batch_version})"
-    )
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -620,7 +980,6 @@ def run_mgda_open_es(
     init: str = "gaussian",
     init_sigma: float = 0.1,
     seed: int = 1,
-    resample_every: int = 0,
     val_every: int = 50,
     pareto_every: int = 100,
     test_loader: DataLoader | None = None,
@@ -636,19 +995,44 @@ def run_mgda_open_es(
     archive_size: int = DEFAULT_ARCHIVE_SIZE,
     archive_selection: str = "nsga2",
     ref_dirs_method: str = "energy",
+    mgda_normalize: str = DEFAULT_MGDA_NORMALIZE,
+    es_fitness_shaping: str = DEFAULT_ES_FITNESS_SHAPING,
+    aggregator: str = DEFAULT_MO_AGGREGATOR,
 ) -> MOESResult:
-    """OpenES with per-objective gradients combined by MGDA (Design A).
+    """OpenES with per-objective gradients combined by MGDA or UPGrad (Design A).
 
     Each generation samples one antithetic population around a single mean and
     evaluates the full objective vector per candidate. Per-objective ES
-    gradients are built from centered ranks of each objective column, and the
-    MGDA min-norm convex combination gives a common descent direction applied
-    with the Optax OpenES optimizer. All candidates feed a non-dominated
-    archive pruned by NSGA-II or NSGA-III survival.
+    gradients are built with ``es_fitness_shaping`` of each objective column,
+    optionally rescaled (``mgda_normalize``), then combined by ``aggregator``
+    (``mgda`` or ``upgrad``) into a common descent direction for the Optax
+    OpenES mean update. All candidates feed a non-dominated archive pruned by
+    NSGA-II or NSGA-III survival.
     """
     n_var = int(problem.n_var)
     n_obj = int(problem.n_obj)
     steps = int(steps)
+    aggregator = aggregator.lower()
+    if aggregator not in MO_AGGREGATORS:
+        raise ValueError(
+            f"Unknown aggregator: {aggregator!r}. Use one of {MO_AGGREGATORS}."
+        )
+    mgda_normalize = mgda_normalize.lower()
+    if mgda_normalize not in MGDA_NORMALIZATIONS:
+        raise ValueError(
+            f"Unknown mgda_normalize: {mgda_normalize!r}. Use one of {MGDA_NORMALIZATIONS}."
+        )
+    if aggregator == "upgrad" and mgda_normalize == "range":
+        print(
+            "Note: --mgda-normalize range is MGDA-specific; "
+            "UPGrad uses l2-normalized grads instead."
+        )
+    es_fitness_shaping = es_fitness_shaping.lower()
+    if es_fitness_shaping not in ES_FITNESS_SHAPINGS:
+        raise ValueError(
+            f"Unknown es_fitness_shaping: {es_fitness_shaping!r}. "
+            f"Use one of {ES_FITNESS_SHAPINGS}."
+        )
     if popsize is None:
         popsize = default_soo_popsize(n_var, "open_es")
     popsize = int(popsize)
@@ -660,10 +1044,14 @@ def run_mgda_open_es(
     sigma_schedule = build_es_sigma_schedule(
         es_sigma_scheduler, sigma0, steps=steps, end=es_sigma_end
     )
-    xl = float(np.asarray(problem.xl).reshape(-1)[0]) if problem.xl is not None else -1.0
-    xu = float(np.asarray(problem.xu).reshape(-1)[0]) if problem.xu is not None else 1.0
+    import jax
+    import jax.numpy as jnp
+
+    xl = float(np.asarray(problem.xl).reshape(-1)[0]) if problem.xl is not None else -10.0
+    xu = float(np.asarray(problem.xu).reshape(-1)[0]) if problem.xu is not None else 10.0
 
     rng = np.random.default_rng(seed)
+    key = jax.random.key(int(seed))
     mean_opt = _MeanOptimizer(
         _init_mean(
             n_var, init, sigma0, rng, theta0=getattr(problem, "theta0", None)
@@ -699,11 +1087,23 @@ def run_mgda_open_es(
     # initial-population nadir.
     mean_F = _evaluate_F(problem, mean_opt.mean)[0]
     archive.update(mean_opt.mean[None, :], mean_F[None, :])
+    # Running per-objective max used as the nadir for "range" weighting.
+    running_nadir = np.clip(mean_F, 0.0, None).copy()
     n_eval = 0
+    init_extra: dict[str, float] = {
+        "center_f": float(mean_F.mean()),
+        "es_sigma": sigma0,
+    }
+    if getattr(problem, "problem_name", "") in L1_PROBLEMS and mean_F.size >= 2:
+        init_extra["l1"] = float(mean_F[1])
+        if getattr(problem, "problem_name", "") == "cross_entropy_l1":
+            init_extra["ce"] = float(mean_F[0])
+        else:
+            init_extra["f1"] = float(1.0 - mean_F[0])
     logger.log_train(
         step=0,
         n_eval=n_eval,
-        extra={"center_f": float(mean_F.mean()), "es_sigma": sigma0},
+        extra=init_extra,
         label="init",
         report_x=mean_opt.mean,
         report_F=mean_F,
@@ -712,34 +1112,86 @@ def run_mgda_open_es(
 
     for gen in range(1, steps + 1):
         sigma = sigma_at(sigma_schedule, gen - 1)
-        eps = _antithetic_noise(rng, popsize // 2, n_var)
-        X = np.clip(mean_opt.mean[None, :] + sigma * eps, xl, xu)
-        F = _evaluate_F(problem, X)
+        mean = jnp.asarray(mean_opt.mean)
+        key, eps = _antithetic_noise(key, popsize // 2, n_var)
+        X = jnp.clip(mean[None, :] + sigma * eps, xl, xu)
+        problem.sample_eval_pool()
+        F_np = _evaluate_F(problem, np.asarray(X))
+        F = jnp.asarray(F_np)
         n_eval = gen * popsize
-        logger.ensure_hv_anchors(F)
+        logger.ensure_hv_anchors(F_np)
 
-        # Per-objective ES gradients from shared samples: G[c] = (1/n sigma) U_c^T eps.
-        eps_eff = (X - mean_opt.mean[None, :]) / sigma
-        U = np.column_stack([_centered_ranks(F[:, c]) for c in range(n_obj)])
-        G = (U.T @ eps_eff) / (popsize * sigma)
-
-        w = mgda_weights(G)
-        direction = w @ G
+        # Per-objective ES gradients from shared samples (JAX + evosax shaping).
+        eps_eff = (X - mean[None, :]) / sigma
+        U = _shape_objectives(F, es_fitness_shaping)
+        G = _es_gradients_multi(U, eps_eff, sigma)
+        running_nadir = np.maximum(running_nadir, F_np.max(axis=0))
+        if aggregator == "mgda" and mgda_normalize == "range":
+            # Solve MGDA on unit grads (pure geometry), then modulate the
+            # weights by range-normalized distance-to-ideal so an objective at
+            # its ideal (scale 0) stops pulling and a far-from-ideal one
+            # (scale ~1) dominates.
+            w = _mgda_weights(_normalize_mgda_gradients(G, mode="l2"))
+            range_scale = jnp.clip(jnp.asarray(mean_F), 0.0, None) / jnp.maximum(
+                jnp.asarray(running_nadir), 1e-12
+            )
+            w = w * range_scale
+            w_sum = float(jnp.sum(w))
+            w = (
+                jnp.full((n_obj,), 1.0 / n_obj)
+                if w_sum <= 1e-12
+                else w / w_sum
+            )
+            direction = w @ G
+        else:
+            direction, w, _ = aggregate_mo_gradients(
+                G,
+                aggregator=aggregator,
+                normalize=mgda_normalize,
+                losses=mean_F,
+            )
         mean_opt.step(direction)
 
         mean_F = _evaluate_F(problem, mean_opt.mean)[0]
+        running_nadir = np.maximum(running_nadir, mean_F)
         archive.update(
-            np.vstack([X, mean_opt.mean[None, :]]), np.vstack([F, mean_F[None, :]])
+            np.vstack([np.asarray(X), mean_opt.mean[None, :]]),
+            np.vstack([F_np, mean_F[None, :]]),
         )
 
+        center_objs: dict[str, float] = {
+            f"center_f{c}": float(mean_F[c]) for c in range(n_obj) if n_obj <= 4
+        }
+        problem_name = getattr(problem, "problem_name", "")
+        if problem_name in L1_PROBLEMS and n_obj >= 2:
+            # Named keys for terminal + wandb (center_f0/f1 stay as aliases).
+            center_objs["l1"] = float(mean_F[1])
+            if problem_name == "cross_entropy_l1":
+                center_objs["ce"] = float(mean_F[0])
+            else:
+                center_objs["f1"] = float(1.0 - mean_F[0])
+        # Alignment of combined direction with each obj grad (common-descent check).
+        G_np = np.asarray(G)
+        d_np = np.asarray(direction)
+        d_norm = float(np.linalg.norm(d_np) + 1e-12)
+        min_align = min(
+            float(np.dot(G_np[c], d_np) / (np.linalg.norm(G_np[c]) * d_norm + 1e-12))
+            for c in range(n_obj)
+        )
         logger.log_train(
             step=gen,
             n_eval=n_eval,
             extra={
                 "center_f": float(mean_F.mean()),
-                "mgda_dir_norm": float(np.linalg.norm(direction)),
-                "mgda_w_max": float(w.max()),
-                "mgda_w_min": float(w.min()),
+                **center_objs,
+                "mo_dir_norm": float(d_norm),
+                "mo_w_max": float(np.max(np.asarray(w))),
+                "mo_w_min": float(np.min(np.asarray(w))),
+                "mo_min_align": float(min_align),
+                # Keep legacy keys for existing W&B panels.
+                "mgda_dir_norm": float(d_norm),
+                "mgda_w_max": float(np.max(np.asarray(w))),
+                "mgda_w_min": float(np.min(np.asarray(w))),
                 "es_sigma": float(sigma),
             },
             label=f"step {gen}",
@@ -747,10 +1199,8 @@ def run_mgda_open_es(
             report_F=mean_F,
         )
         logger.maybe_validate(step=gen, n_eval=n_eval, center=mean_opt.mean)
-        _maybe_resample(
-            problem, gen=gen, steps=steps, resample_every=resample_every
-        )
 
+    algo_name = "upgrad_open_es" if aggregator == "upgrad" else "mgda_open_es"
     return MOESResult(
         X=archive.X,
         F=archive.F,
@@ -759,12 +1209,19 @@ def run_mgda_open_es(
         steps=steps,
         popsize=popsize,
         n_eval=n_eval,
-        algo="mgda_open_es",
+        algo=algo_name,
         details={
             "center_f": float(mean_F.mean()),
+            "aggregator": aggregator,
             **logger.last_val,
         },
     )
+
+
+def run_upgrad_open_es(*args, **kwargs) -> MOESResult:
+    """Design A with UPGrad dual-cone aggregation (see ``run_mgda_open_es``)."""
+    kwargs["aggregator"] = "upgrad"
+    return run_mgda_open_es(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -781,7 +1238,6 @@ def run_moead_open_es(
     init: str = "gaussian",
     init_sigma: float = 0.1,
     seed: int = 1,
-    resample_every: int = 0,
     val_every: int = 50,
     pareto_every: int = 100,
     test_loader: DataLoader | None = None,
@@ -843,14 +1299,18 @@ def run_moead_open_es(
     lam = np.maximum(lam, 1e-6)
     lam /= lam.sum(axis=1, keepdims=True)
 
+    import jax
+    import jax.numpy as jnp
+
     sigma0 = float(init_sigma)
     sigma_schedule = build_es_sigma_schedule(
         es_sigma_scheduler, sigma0, steps=steps, end=es_sigma_end
     )
-    xl = float(np.asarray(problem.xl).reshape(-1)[0]) if problem.xl is not None else -1.0
-    xu = float(np.asarray(problem.xu).reshape(-1)[0]) if problem.xu is not None else 1.0
+    xl = float(np.asarray(problem.xl).reshape(-1)[0]) if problem.xl is not None else -10.0
+    xu = float(np.asarray(problem.xu).reshape(-1)[0]) if problem.xu is not None else 10.0
 
     rng = np.random.default_rng(seed)
+    key = jax.random.key(int(seed))
     mean_opts = [
         _MeanOptimizer(
             _init_mean(
@@ -905,14 +1365,28 @@ def run_moead_open_es(
     logger.ensure_hv_anchors(means_F)
     n_eval = 0
     best_center_i = int(np.argmin(means_F.mean(axis=1)))
+    lam_j = jnp.asarray(lam)
+    ideal_j = jnp.asarray(ideal)
     logger.log_train(
         step=0,
         n_eval=n_eval,
         extra={
-            "tcheby_mean": float(np.mean([
-                scalarize(means_F[j : j + 1], lam[j], ideal, method=scalarization, rho=rho)[0]
-                for j in range(k)
-            ])),
+            "tcheby_mean": float(
+                jnp.mean(
+                    jnp.stack(
+                        [
+                            _scalarize(
+                                means_F[j : j + 1],
+                                lam_j[j],
+                                ideal_j,
+                                method=scalarization,
+                                rho=rho,
+                            )[0]
+                            for j in range(k)
+                        ]
+                    )
+                )
+            ),
             "es_sigma": sigma0,
             "center_f": float(means_F[best_center_i].mean()),
         },
@@ -924,33 +1398,40 @@ def run_moead_open_es(
         step=0, n_eval=n_eval, center=means_X[best_center_i], force=True
     )
 
+    tcheby_bests = np.full(k, np.nan, dtype=np.float64)
     for gen in range(1, steps + 1):
         # Sample and evaluate all subpopulations first so the ideal point
         # update is shared within the generation.
         sigma = sigma_at(sigma_schedule, gen - 1)
+        # One shared fitness batch for all means this generation (CRN).
+        problem.sample_eval_pool()
         X_all: list[np.ndarray] = []
         F_all: list[np.ndarray] = []
-        eps_eff_all: list[np.ndarray] = []
+        eps_eff_all = []
         for j in range(k):
-            eps = _antithetic_noise(rng, per_mean // 2, n_var)
-            X_j = np.clip(mean_opts[j].mean[None, :] + sigma * eps, xl, xu)
-            F_j = _evaluate_F(problem, X_j)
-            eps_eff_all.append((X_j - mean_opts[j].mean[None, :]) / sigma)
-            X_all.append(X_j)
+            mean_j = jnp.asarray(mean_opts[j].mean)
+            key, eps = _antithetic_noise(key, per_mean // 2, n_var)
+            X_j = jnp.clip(mean_j[None, :] + sigma * eps, xl, xu)
+            F_j = _evaluate_F(problem, np.asarray(X_j))
+            eps_eff_all.append((X_j - mean_j[None, :]) / sigma)
+            X_all.append(np.asarray(X_j))
             F_all.append(F_j)
         n_eval = gen * total_popsize
 
         F_gen = np.vstack(F_all)
         if ideal_mode == "adaptive":
             ideal = np.minimum(ideal, F_gen.min(axis=0))
+            ideal_j = jnp.asarray(ideal)
         logger.ensure_hv_anchors(F_gen)
 
         tcheby_bests = np.empty(k, dtype=np.float64)
         for j in range(k):
-            s = scalarize(F_all[j], lam[j], ideal, method=scalarization, rho=rho)
-            tcheby_bests[j] = float(s.min())
+            s = _scalarize(
+                F_all[j], lam_j[j], ideal_j, method=scalarization, rho=rho
+            )
+            tcheby_bests[j] = float(jnp.min(s))
             u = _centered_ranks(s)
-            g = (u @ eps_eff_all[j]) / (per_mean * sigma)
+            g = _es_gradient(u, eps_eff_all[j], sigma)
             mean_opts[j].step(g)
 
         archive.update(np.vstack(X_all), F_gen)
@@ -960,9 +1441,15 @@ def run_moead_open_es(
             means_F = _evaluate_F(problem, means_X)  # not counted (diagnostic)
             n_migrated = 0
             for j in range(k):
-                mean_s = scalarize(
-                    means_F[j : j + 1], lam[j], ideal, method=scalarization, rho=rho
-                )[0]
+                mean_s = float(
+                    _scalarize(
+                        means_F[j : j + 1],
+                        lam_j[j],
+                        ideal_j,
+                        method=scalarization,
+                        rho=rho,
+                    )[0]
+                )
                 idx, best_s = archive.best_scalarized(
                     lam[j], ideal, rho, method=scalarization
                 )
@@ -991,9 +1478,6 @@ def run_moead_open_es(
         )
         logger.maybe_validate(
             step=gen, n_eval=n_eval, center=means_X[best_center_i]
-        )
-        _maybe_resample(
-            problem, gen=gen, steps=steps, resample_every=resample_every
         )
 
     # Final means evaluation for reporting and archive inclusion.
@@ -1040,6 +1524,8 @@ def build_mo_es_wandb_config(
         "fitness": "vector",
         "init": args.init,
         "init_sigma": getattr(args, "init_sigma", 0.1),
+        "xl": getattr(args, "xl", -10.0),
+        "xu": getattr(args, "xu", 10.0),
         "es_optim": getattr(args, "es_optim", DEFAULT_ES_OPTIM),
         "es_optim_lr": getattr(args, "es_optim_lr", DEFAULT_ES_OPTIM_LR),
         "es_optim_scheduler": getattr(args, "es_optim_scheduler", DEFAULT_ES_OPTIM_SCHEDULER),
@@ -1050,9 +1536,9 @@ def build_mo_es_wandb_config(
         "evals": getattr(args, "evals", None),
         "popsize": popsize,
         "batch_size": args.batch_size,
-        "eval_mode": getattr(args, "eval_mode", "single"),
-        "eval_batches": getattr(args, "eval_batches", 8),
-        "resample_every": args.resample_every,
+        "eval_mode": getattr(args, "eval_mode", "multi"),
+        "eval_batches": getattr(args, "eval_batches", 50),
+        "sampler": getattr(args, "sampler", "auto"),
         "val_every": args.val_every,
         "pareto_every": getattr(args, "pareto_every", 100),
         "val_batch_size": args.val_batch_size,
@@ -1062,6 +1548,10 @@ def build_mo_es_wandb_config(
         "n_obj": n_obj,
         "archive_size": getattr(args, "archive_size", DEFAULT_ARCHIVE_SIZE),
         "archive_selection": getattr(args, "archive_selection", "nsga2"),
+        "mgda_normalize": getattr(args, "mgda_normalize", DEFAULT_MGDA_NORMALIZE),
+        "es_fitness_shaping": getattr(
+            args, "es_fitness_shaping", DEFAULT_ES_FITNESS_SHAPING
+        ),
         "wandb_x_axis": "Function Evaluations",
     }
     algo_config: dict[str, Any] = {
@@ -1077,6 +1567,10 @@ def build_mo_es_wandb_config(
         "archive_size": config["archive_size"],
         "archive_selection": config["archive_selection"],
     }
+    if algo in {"mgda_open_es", "upgrad_open_es"}:
+        algo_config["aggregator"] = "upgrad" if algo == "upgrad_open_es" else "mgda"
+        algo_config["mgda_normalize"] = config["mgda_normalize"]
+        algo_config["es_fitness_shaping"] = config["es_fitness_shaping"]
     if algo == "moead_open_es":
         moead = {
             "k": getattr(args, "moead_k", DEFAULT_MOEAD_K),

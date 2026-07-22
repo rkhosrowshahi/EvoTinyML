@@ -21,6 +21,7 @@ class NDValidationResult:
     macro_f1: np.ndarray  # (n_nd,)
     macro_precision: np.ndarray  # (n_nd,)
     macro_recall: np.ndarray  # (n_nd,)
+    mean_ce: np.ndarray  # (n_nd,) overall mean CE on the test set
     per_class_acc: np.ndarray  # (n_nd, n_classes)
     per_class_f1: np.ndarray  # (n_nd, n_classes)
     per_class_ce: np.ndarray  # (n_nd, n_classes)
@@ -256,6 +257,7 @@ def validate_nd_set(
     macro_f1 = np.empty(n, dtype=np.float64)
     macro_precision = np.empty(n, dtype=np.float64)
     macro_recall = np.empty(n, dtype=np.float64)
+    mean_ce = np.empty(n, dtype=np.float64)
     per_class_acc = np.empty((n, n_classes), dtype=np.float64)
     per_class_f1 = np.empty((n, n_classes), dtype=np.float64)
     per_class_ce = np.empty((n, n_classes), dtype=np.float64)
@@ -273,6 +275,7 @@ def validate_nd_set(
         macro_f1[i] = f1
         macro_precision[i] = prec
         macro_recall[i] = rec
+        mean_ce[i] = float(loss_np.mean())
         per_class_acc[i] = acc_c
         per_class_f1[i] = f1_c
         per_class_ce[i] = ce_c
@@ -289,6 +292,7 @@ def validate_nd_set(
         macro_f1=macro_f1,
         macro_precision=macro_precision,
         macro_recall=macro_recall,
+        mean_ce=mean_ce,
         per_class_acc=per_class_acc,
         per_class_f1=per_class_f1,
         per_class_ce=per_class_ce,

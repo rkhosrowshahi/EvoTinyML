@@ -1,4 +1,4 @@
-"""Train TinyCNN with SGD (lr=0.1)."""
+"""Train TinyCNN with SGD (lr=0.1) or Adam (lr=0.001)."""
 
 from __future__ import annotations
 
@@ -10,16 +10,28 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from evotinyml.data import load_dataset
+from evotinyml.device import resolve_device
 from evotinyml.model import ACTIVATIONS, build_model
+
+OPTIMIZERS = ("sgd", "adam")
+DEFAULT_LR = {"sgd": 0.1, "adam": 1e-3}
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train TinyCNN with SGD (lr=0.1).")
+    parser = argparse.ArgumentParser(
+        description="Train TinyCNN with SGD (lr=0.1) or Adam (lr=0.001)."
+    )
     parser.add_argument(
         "--dataset",
         choices=("mnist", "mnist_2cls", "cifar10"),
         required=True,
         help="Dataset: mnist (10-class), mnist_2cls (digits 0/1), or cifar10.",
+    )
+    parser.add_argument(
+        "--optimizer",
+        choices=OPTIMIZERS,
+        default="sgd",
+        help="Optimizer: sgd (default lr 0.1) or adam (default lr 0.001).",
     )
     parser.add_argument(
         "--activation",
@@ -29,12 +41,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
     parser.add_argument("--batch-size", type=int, default=128, help="Mini-batch size.")
-    parser.add_argument("--lr", type=float, default=0.1, help="SGD learning rate.")
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help="Learning rate (default: 0.1 for SGD, 0.001 for Adam).",
+    )
     parser.add_argument("--momentum", type=float, default=0.9, help="SGD momentum.")
-    parser.add_argument("--weight-decay", type=float, default=1e-4, help="SGD weight decay.")
+    parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay.")
     parser.add_argument("--seed", type=int, default=1, help="RNG seed.")
     parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root.")
-    parser.add_argument("--device", type=str, default="cpu", help="Torch device, e.g. cpu or cuda.")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        help=(
+            "Torch device: cpu, cuda, mps, or gpu "
+            "(gpu → CUDA if available, else MPS)."
+        ),
+    )
     parser.add_argument(
         "--out",
         type=str,
@@ -42,7 +67,10 @@ def parse_args() -> argparse.Namespace:
         help="Optional path to save the trained model checkpoint (.pt).",
     )
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.lr is None:
+        args.lr = DEFAULT_LR[args.optimizer]
+    return args
 
 
 @torch.no_grad()
@@ -92,9 +120,33 @@ def train_one_epoch(
     return total_loss / n, correct / n
 
 
+def build_optimizer(
+    name: str,
+    model: torch.nn.Module,
+    lr: float,
+    momentum: float,
+    weight_decay: float,
+) -> torch.optim.Optimizer:
+    if name == "sgd":
+        return torch.optim.SGD(
+            model.parameters(),
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+        )
+    if name == "adam":
+        return torch.optim.Adam(
+            model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+    raise ValueError(f"Unsupported optimizer: {name!r}. Use one of {OPTIMIZERS}.")
+
+
 def run(args: argparse.Namespace):
     torch.manual_seed(args.seed)
-    device = torch.device(args.device)
+    device = resolve_device(args.device)
+    args.device = str(device)
 
     train_ds, num_classes = load_dataset(args.dataset, root=args.data_root, train=True)
     test_ds, _ = load_dataset(args.dataset, root=args.data_root, train=False)
@@ -113,8 +165,9 @@ def run(args: argparse.Namespace):
     )
 
     model = build_model(args.dataset, num_classes, activation=args.activation).to(device)
-    optimizer = torch.optim.SGD(
-        model.parameters(),
+    optimizer = build_optimizer(
+        args.optimizer,
+        model,
         lr=args.lr,
         momentum=args.momentum,
         weight_decay=args.weight_decay,
@@ -122,9 +175,9 @@ def run(args: argparse.Namespace):
 
     print(
         f"dataset={args.dataset}  activation={args.activation}  "
-        f"params={model.num_parameters()}  "
+        f"optimizer={args.optimizer}  params={model.num_parameters()}  "
         f"epochs={args.epochs}  batch_size={args.batch_size}  "
-        f"lr={args.lr}  momentum={args.momentum}  device={device}"
+        f"lr={args.lr}  device={device}"
     )
 
     best_acc = 0.0
@@ -158,6 +211,7 @@ def run(args: argparse.Namespace):
                 "model_state_dict": model.state_dict(),
                 "dataset": args.dataset,
                 "activation": args.activation,
+                "optimizer": args.optimizer,
                 "num_classes": num_classes,
                 "epochs": args.epochs,
                 "lr": args.lr,

@@ -24,3 +24,7 @@ results/
 .idea/
 .vscode/
 *.swp
+
+presentation/
+
+.pytest_cache/

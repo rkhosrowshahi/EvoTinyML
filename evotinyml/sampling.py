@@ -70,15 +70,14 @@ class ZeroWeightSampling(Sampling):
 
 
 class PytorchDefaultSampling(Sampling):
-    """One individual at PyTorch default ``theta0``; rest ``theta0 + N(0, sigma)``.
+    """Initialize every individual at PyTorch default ``theta0``.
 
     ``theta0`` is taken from the constructor arg, else ``problem.theta0``.
+    ``init_sigma`` is unused.
     """
 
     def __init__(self, sigma: float = 0.1, theta0: np.ndarray | None = None) -> None:
         super().__init__()
-        if sigma <= 0:
-            raise ValueError(f"init_sigma must be > 0, got {sigma}")
         self.sigma = float(sigma)
         self.theta0 = (
             None if theta0 is None else np.asarray(theta0, dtype=np.float64).ravel()
@@ -102,13 +101,7 @@ class PytorchDefaultSampling(Sampling):
 
     def _do(self, problem, n_samples, **kwargs):
         theta0 = self._resolve_theta0(problem)
-        X = np.empty((n_samples, problem.n_var), dtype=np.float64)
-        X[0] = theta0
-        if n_samples > 1:
-            X[1:] = theta0 + np.random.normal(
-                0.0, self.sigma, size=(n_samples - 1, problem.n_var)
-            )
-        return X
+        return np.tile(theta0, (n_samples, 1))
 
 
 def get_population_init(
