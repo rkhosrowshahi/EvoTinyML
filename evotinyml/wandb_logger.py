@@ -135,7 +135,7 @@ def init_wandb(
         project=getattr(args, "wandb_project", DEFAULT_PROJECT),
         name=run_name,
         config=config,
-        reinit=True,
+        reinit="finish_previous",
     )
     define_wandb_n_eval_metric()
     return run

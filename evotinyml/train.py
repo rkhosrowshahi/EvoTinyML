@@ -1132,7 +1132,7 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
             project=args.wandb_project,
             name=run_name,
             config=config,
-            reinit=True,
+            reinit="finish_previous",
         )
         define_wandb_n_eval_metric()
 
@@ -1333,7 +1333,7 @@ def run_mo_es(args: argparse.Namespace, problem, test_loader, num_classes: int, 
             project=args.wandb_project,
             name=run_name,
             config=config,
-            reinit=True,
+            reinit="finish_previous",
         )
         define_wandb_n_eval_metric()
 
