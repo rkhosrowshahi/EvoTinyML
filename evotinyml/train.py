@@ -605,7 +605,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optimization steps after init. Default: 100000 if --evals omitted. "
-            "Ignored when --evals is set (steps = evals // popsize)."
+            "Ignored when --evals is set (steps = ceil(evals / popsize))."
         ),
     )
     parser.add_argument(
@@ -614,7 +614,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Function-evaluation budget (train fitness calls). "
-            "Sets steps = evals // popsize (ES/NSGA: one generation costs popsize evals)."
+            "Sets steps = ceil(evals / popsize) (ES/NSGA: one generation costs popsize evals)."
         ),
     )
     parser.add_argument(
@@ -753,7 +753,7 @@ def _resolve_popsize(args: argparse.Namespace, n_var: int) -> int:
 def _resolve_steps_and_evals(args: argparse.Namespace, popsize: int) -> tuple[int, int]:
     """Resolve ``(steps, evals)`` from ``--steps`` and/or ``--evals``.
 
-    ``--evals`` wins when set: ``steps = evals // popsize``.
+    ``--evals`` wins when set: ``steps = ceil(evals / popsize)`` (may exceed budget).
     """
     popsize = int(popsize)
     if popsize < 1:
@@ -761,16 +761,14 @@ def _resolve_steps_and_evals(args: argparse.Namespace, popsize: int) -> tuple[in
 
     if args.evals is not None:
         evals = int(args.evals)
-        if evals < popsize:
-            raise SystemExit(
-                f"--evals ({evals}) must be >= popsize ({popsize})"
-            )
-        steps = evals // popsize
+        if evals < 1:
+            raise SystemExit(f"--evals must be >= 1, got {evals}")
+        steps = int(np.ceil(evals / popsize))
         used = steps * popsize
-        if used != evals:
+        if used > evals:
             print(
-                f"Note: --evals={evals} not divisible by popsize={popsize}; "
-                f"using steps={steps} ({used} Function Evaluations)."
+                f"Note: --evals={evals} -> steps={steps} "
+                f"({used} Function Evaluations)."
             )
         if args.steps is not None and int(args.steps) != steps:
             print(
