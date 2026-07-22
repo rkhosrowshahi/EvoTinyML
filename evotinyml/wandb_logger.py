@@ -219,7 +219,7 @@ def save_wandb_checkpoint(
     path = Path(wandb.run.dir) / CHECKPOINT_NAME
     torch.save(payload, path)
     # Explicitly mark for upload (also covered by living under run.dir).
-    wandb.save(str(path), base_path=str(path.parent), policy="now", glob=False)
+    wandb.save(str(path), base_path=str(path.parent), policy="now")
     return path
 
 
