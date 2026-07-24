@@ -6,12 +6,12 @@ import torch
 from torch.utils.data import TensorDataset
 
 from evotinyml.data import RandomBatchSampler
-from evotinyml.model import TinyCNN_MNIST, build_model
+from evotinyml.model import TinyCNN_MNIST_4K, build_model
 from evotinyml.problem import ERMCrossEntropyProblem
 
 
 def test_tinycnn_mnist_matches_esde_param_count():
-    model = TinyCNN_MNIST()
+    model = TinyCNN_MNIST_4K()
     assert model.num_parameters() == 4266
     assert build_model("mnist", 10).num_parameters() == 4266
 
@@ -21,7 +21,7 @@ def test_sample_eval_pool_draws_new_batch():
     targets = torch.randint(0, 10, (512,))
     ds = TensorDataset(images, targets)
     sampler = RandomBatchSampler(ds, batch_size=64, num_classes=10, seed=0)
-    model = TinyCNN_MNIST()
+    model = TinyCNN_MNIST_4K()
     problem = ERMCrossEntropyProblem(
         model, sampler, eval_mode="single", eval_batches=1, device=torch.device("cpu")
     )
@@ -40,7 +40,7 @@ def test_eval_mode_single_uses_one_batch():
     targets = torch.randint(0, 10, (256,))
     ds = TensorDataset(images, targets)
     sampler = RandomBatchSampler(ds, batch_size=32, num_classes=10, seed=1)
-    model = TinyCNN_MNIST()
+    model = TinyCNN_MNIST_4K()
     problem = ERMCrossEntropyProblem(
         model, sampler, eval_mode="single", eval_batches=50, device=torch.device("cpu")
     )

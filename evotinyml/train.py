@@ -75,7 +75,7 @@ from evotinyml.soo.es import (
     run_soo_es,
 )
 from evotinyml.data import EVAL_MODES, load_dataset
-from evotinyml.model import ACTIVATIONS, build_model
+from evotinyml.model import ACTIVATIONS, MODELS, build_model, resolve_model_name
 from evotinyml.problem import (
     CE_SOFT_PR_PROBLEMS,
     DEFAULT_XL,
@@ -157,6 +157,17 @@ def parse_args() -> argparse.Namespace:
             "SOO weighted-sum weights for multi-objective problems: comma-separated "
             "non-negative floats, length = n_obj (e.g. 1,1 or 1,0.1). "
             "Default: problem-specific equal ones (unweighted sum). Ignored for MOO/MO-ES."
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        type=str.lower,
+        choices=tuple(MODELS),
+        default=None,
+        help=(
+            "Architecture (case-insensitive): tinycnn_mnist_4k (mnist*), "
+            "tinycnn_cifar_4k / tinycnn_cifar_34k / butterflynet_cifar_4k (cifar10). "
+            "Default: tinycnn_mnist_4k for mnist*, tinycnn_cifar_34k for cifar10."
         ),
     )
     parser.add_argument(
@@ -858,7 +869,7 @@ def run_moo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
 
     n_ref = len(algorithm.ref_dirs) if args.algo == "nsga3" else None
     print(
-        f"dataset={args.dataset}  problem={args.problem}  "
+        f"dataset={args.dataset}  model={args.model}  problem={args.problem}  "
         f"activation={args.activation}  algo={args.algo}  "
         f"fitness=vector  "
         f"init={args.init}(sigma={args.init_sigma})  "
@@ -991,6 +1002,7 @@ def run_moo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
             X=X,
             F=F,
             dataset=args.dataset,
+            model=args.model,
             problem=args.problem,
             activation=args.activation,
             algo=args.algo,
@@ -1020,6 +1032,7 @@ def run_moo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
         X[ckpt_idx],
         meta={
             "dataset": args.dataset,
+            "model": args.model,
             "problem": args.problem,
             "activation": args.activation,
             "algo": args.algo,
@@ -1197,7 +1210,7 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
     sol_tag = "best" if algo in POPULATION_BASED_ALGOS else "mean"
     w_str = ",".join(f"{x:g}" for x in args.scalar_weights_resolved)
     print(
-        f"dataset={args.dataset}  problem={args.problem}  "
+        f"dataset={args.dataset}  model={args.model}  problem={args.problem}  "
         f"activation={args.activation}  algo={algo} ({display})  "
         f"fitness={fitness_name}  scalar_weights=[{w_str}]  "
         f"init={args.init}(sigma={args.init_sigma})  "
@@ -1286,6 +1299,7 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
             f=result.f,
             mean_f_history=result.mean_f_history,
             dataset=args.dataset,
+            model=args.model,
             problem=args.problem,
             activation=args.activation,
             algo=args.algo,
@@ -1311,6 +1325,7 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
         result.X,
         meta={
             "dataset": args.dataset,
+            "model": args.model,
             "problem": args.problem,
             "activation": args.activation,
             "algo": args.algo,
@@ -1376,7 +1391,7 @@ def run_mo_es(args: argparse.Namespace, problem, test_loader, num_classes: int, 
             f"migrate_every={args.moead_migrate_every}  ref_dirs={args.ref_dirs}"
         )
     print(
-        f"dataset={args.dataset}  problem={args.problem}  "
+        f"dataset={args.dataset}  model={args.model}  problem={args.problem}  "
         f"activation={args.activation}  algo={algo}  "
         f"fitness=vector  "
         f"init={args.init}(sigma={args.init_sigma})  "
@@ -1483,6 +1498,7 @@ def run_mo_es(args: argparse.Namespace, problem, test_loader, num_classes: int, 
             means=result.means,
             means_F=result.means_F,
             dataset=args.dataset,
+            model=args.model,
             problem=args.problem,
             activation=args.activation,
             algo=args.algo,
@@ -1510,6 +1526,7 @@ def run_mo_es(args: argparse.Namespace, problem, test_loader, num_classes: int, 
         result.X[best_idx],
         meta={
             "dataset": args.dataset,
+            "model": args.model,
             "problem": args.problem,
             "activation": args.activation,
             "algo": args.algo,
@@ -1537,7 +1554,10 @@ def run(args: argparse.Namespace):
     args.device = str(device)
     dataset, num_classes = load_dataset(args.dataset, root=args.data_root, train=True)
     test_dataset, _ = load_dataset(args.dataset, root=args.data_root, train=False)
-    model = build_model(args.dataset, num_classes, activation=args.activation)
+    args.model = resolve_model_name(args.dataset, args.model)
+    model = build_model(
+        args.dataset, num_classes, activation=args.activation, model=args.model
+    )
     test_loader = make_test_loader(test_dataset, batch_size=args.val_batch_size)
 
     # Normalize aliases (e.g. cwce -> cwrm_cross_entropy).

@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 
 from evotinyml.data import load_dataset
 from evotinyml.device import resolve_device
-from evotinyml.model import ACTIVATIONS, build_model
+from evotinyml.model import ACTIVATIONS, MODELS, build_model, resolve_model_name
 
 OPTIMIZERS = ("sgd", "adam")
 DEFAULT_LR = {"sgd": 0.1, "adam": 1e-3}
@@ -32,6 +32,17 @@ def parse_args() -> argparse.Namespace:
         choices=OPTIMIZERS,
         default="sgd",
         help="Optimizer: sgd (default lr 0.1) or adam (default lr 0.001).",
+    )
+    parser.add_argument(
+        "--model",
+        type=str.lower,
+        choices=tuple(MODELS),
+        default=None,
+        help=(
+            "Architecture (case-insensitive): tinycnn_mnist_4k (mnist*), "
+            "tinycnn_cifar_4k / tinycnn_cifar_34k / butterflynet_cifar_4k (cifar10). "
+            "Default: tinycnn_mnist_4k for mnist*, tinycnn_cifar_34k for cifar10."
+        ),
     )
     parser.add_argument(
         "--activation",
@@ -164,7 +175,10 @@ def run(args: argparse.Namespace):
         num_workers=args.num_workers,
     )
 
-    model = build_model(args.dataset, num_classes, activation=args.activation).to(device)
+    args.model = resolve_model_name(args.dataset, args.model)
+    model = build_model(
+        args.dataset, num_classes, activation=args.activation, model=args.model
+    ).to(device)
     optimizer = build_optimizer(
         args.optimizer,
         model,
@@ -174,7 +188,7 @@ def run(args: argparse.Namespace):
     )
 
     print(
-        f"dataset={args.dataset}  activation={args.activation}  "
+        f"dataset={args.dataset}  model={args.model}  activation={args.activation}  "
         f"optimizer={args.optimizer}  params={model.num_parameters()}  "
         f"epochs={args.epochs}  batch_size={args.batch_size}  "
         f"lr={args.lr}  device={device}"
@@ -210,6 +224,7 @@ def run(args: argparse.Namespace):
             {
                 "model_state_dict": model.state_dict(),
                 "dataset": args.dataset,
+                "model": args.model,
                 "activation": args.activation,
                 "optimizer": args.optimizer,
                 "num_classes": num_classes,

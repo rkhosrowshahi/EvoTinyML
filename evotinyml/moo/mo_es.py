@@ -1533,6 +1533,7 @@ def build_mo_es_wandb_config(
     algo = getattr(args, "algo", "mgda_open_es")
     config = {
         "dataset": args.dataset,
+        "model": getattr(args, "model", None),
         "problem": args.problem,
         "activation": args.activation,
         "algo": algo,

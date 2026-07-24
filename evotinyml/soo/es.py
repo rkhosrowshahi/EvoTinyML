@@ -906,6 +906,7 @@ def build_soo_wandb_config(
         library = "evosax"
     return {
         "dataset": args.dataset,
+        "model": getattr(args, "model", None),
         "problem": args.problem,
         "activation": args.activation,
         "algo": algo,

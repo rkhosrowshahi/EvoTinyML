@@ -65,6 +65,7 @@ def build_wandb_config(
 
     config = {
         "dataset": args.dataset,
+        "model": getattr(args, "model", None),
         "problem": args.problem,
         "activation": args.activation,
         "algo": args.algo,
