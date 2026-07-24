@@ -41,11 +41,16 @@ from evotinyml.moo.mo_es import (
 from evotinyml.moo.termination import MaximumStepTermination
 from evotinyml.soo.algorithms import SOO_ALGORITHMS
 from evotinyml.soo.es import (
-    DEFAULT_ES_OPTIM,
     DEFAULT_ASEBO_SUBSPACE_DIMS,
     DEFAULT_DE_CR,
     DEFAULT_DE_ELITISM,
     DEFAULT_DE_F,
+    DEFAULT_ES_OPTIM,
+    DEFAULT_ES_OPTIM_LR,
+    DEFAULT_ES_OPTIM_MOMENTUM,
+    DEFAULT_ES_OPTIM_SCHEDULER,
+    DEFAULT_ES_OPTIM_WD,
+    DEFAULT_ES_SIGMA_SCHEDULER,
     DEFAULT_JDE_CR_INIT,
     DEFAULT_JDE_ELITISM,
     DEFAULT_JDE_F_INIT,
@@ -57,11 +62,7 @@ from evotinyml.soo.es import (
     DEFAULT_PSO_INERTIA,
     DEFAULT_PSO_MAX_VELOCITY,
     DEFAULT_PSO_SOCIAL,
-    DEFAULT_ES_OPTIM_LR,
-    DEFAULT_ES_OPTIM_MOMENTUM,
-    DEFAULT_ES_OPTIM_SCHEDULER,
-    DEFAULT_ES_OPTIM_WD,
-    DEFAULT_ES_SIGMA_SCHEDULER,
+    DEFAULT_SPARSE_ES_MASK_PROB,
     ES_OPTIMS,
     ES_OPTIM_SCHEDULERS,
     ES_SIGMA_SCHEDULERS,
@@ -170,7 +171,7 @@ def parse_args() -> argparse.Namespace:
         default="nsga2",
         help=(
             "Optimizer: nsga2 / nsga3 (MOO), cmaes / snes / xnes / open_es / "
-            "cr_fm_nes / asebo / lm_ma_es / de / jde / pso "
+            "sparse_open_es / cr_fm_nes / asebo / lm_ma_es / de / jde / pso "
             "(SOO: ERM or weighted-sum scalarization of any MOO problem), "
             "or mgda_open_es / upgrad_open_es / moead_open_es "
             "(multi-objective OpenES on vector problems, e.g. cwrm_cross_entropy)."
@@ -295,7 +296,7 @@ def parse_args() -> argparse.Namespace:
         choices=ES_OPTIMS,
         default=DEFAULT_ES_OPTIM,
         help=(
-            f"Mean-update optimizer (optax) for open_es / snes / xnes / asebo. "
+            f"Mean-update optimizer (optax) for open_es / sparse_open_es / snes / xnes / asebo. "
             f"Default: {DEFAULT_ES_OPTIM}. "
             "Ignored for cmaes / cr_fm_nes / lm_ma_es / de / jde / pso."
         ),
@@ -305,7 +306,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_ES_OPTIM_LR,
         help=(
-            f"Optimizer learning rate for open_es / snes / xnes / asebo "
+            f"Optimizer learning rate for open_es / sparse_open_es / snes / xnes / asebo "
             f"(initial value if scheduled). Default: {DEFAULT_ES_OPTIM_LR}. "
             "Ignored for cmaes / cr_fm_nes / lm_ma_es / de / jde / pso."
         ),
@@ -315,7 +316,7 @@ def parse_args() -> argparse.Namespace:
         choices=ES_OPTIM_SCHEDULERS,
         default=DEFAULT_ES_OPTIM_SCHEDULER,
         help=(
-            "LR schedule over steps for open_es / snes / xnes / asebo: constant, "
+            "LR schedule over steps for open_es / sparse_open_es / snes / xnes / asebo: constant, "
             "cosine (decay to 0 over steps), or exponential. "
             "Ignored for cmaes / cr_fm_nes / lm_ma_es / de / jde / pso."
         ),
@@ -325,7 +326,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_ES_OPTIM_MOMENTUM,
         help=(
-            f"Momentum for sgd / rmsprop (0 = off) on open_es / snes / xnes / asebo. "
+            f"Momentum for sgd / rmsprop (0 = off) on open_es / sparse_open_es / snes / xnes / asebo. "
             f"Default: {DEFAULT_ES_OPTIM_MOMENTUM}. "
             "Ignored for adam/adamw and cmaes / cr_fm_nes / lm_ma_es / de / jde / pso."
         ),
@@ -335,7 +336,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_ES_OPTIM_WD,
         help=(
-            f"Weight decay for mean Optax update on open_es / snes / xnes / asebo "
+            f"Weight decay for mean Optax update on open_es / sparse_open_es / snes / xnes / asebo "
             f"(0 = off). adamw: decoupled WD; sgd / adam / rmsprop: add_decayed_weights. "
             f"Default: {DEFAULT_ES_OPTIM_WD}. "
             "Ignored for cmaes / cr_fm_nes / lm_ma_es / de / jde / pso."
@@ -346,7 +347,7 @@ def parse_args() -> argparse.Namespace:
         choices=ES_SIGMA_SCHEDULERS,
         default=DEFAULT_ES_SIGMA_SCHEDULER,
         help=(
-            "OpenES / ASEBO / MO-OpenES sampling-noise (σ) schedule over steps: "
+            "OpenES / SparseOpenES / ASEBO / MO-OpenES sampling-noise (σ) schedule over steps: "
             "constant, cosine, or exponential. Start value is --init-sigma. "
             "Ignored for cmaes / snes / xnes / cr_fm_nes / lm_ma_es / de / jde / pso."
         ),
@@ -368,6 +369,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             f"ASEBO active-subspace rank (FIFO gradient history). "
             f"Default: {DEFAULT_ASEBO_SUBSPACE_DIMS}. Ignored for other algos."
+        ),
+    )
+    parser.add_argument(
+        "--sparse-es-mask-prob",
+        type=float,
+        default=DEFAULT_SPARSE_ES_MASK_PROB,
+        help=(
+            f"SparseOpenES: probability of zeroing each isotropic-noise dimension "
+            f"before antithetic sampling. Default: {DEFAULT_SPARSE_ES_MASK_PROB}. "
+            "Ignored for other algos."
         ),
     )
     parser.add_argument(
@@ -624,7 +635,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Population size. Default: 100 for NSGA; "
             "4+3*ln(n_var) for SOO ES (~25 for TinyCNN; even for open_es / "
-            "cr_fm_nes / asebo)."
+            "sparse_open_es / cr_fm_nes / asebo)."
         ),
     )
     parser.add_argument("--batch-size", type=int, default=1024, help="Eval batch size.")
@@ -1066,12 +1077,12 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
         print(
             f"Note: --es-optim / --es-optim-lr / --es-optim-scheduler / "
             f"--es-optim-momentum / --es-optim-wd are ignored for --algo {algo} "
-            f"(open_es / snes / xnes / asebo only)."
+            f"(open_es / sparse_open_es / snes / xnes / asebo only)."
         )
     if not uses_sigma_schedule and es_sigma_opts_nondefault:
         print(
             f"Note: --es-sigma-scheduler / --es-sigma-end are ignored for "
-            f"--algo {algo} (open_es / asebo only)."
+            f"--algo {algo} (open_es / sparse_open_es / asebo only)."
         )
     if (
         algo != "asebo"
@@ -1080,6 +1091,14 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
         print(
             f"Note: --asebo-subspace-dims is ignored for --algo {algo} "
             f"(asebo only)."
+        )
+    if (
+        algo != "sparse_open_es"
+        and float(args.sparse_es_mask_prob) != DEFAULT_SPARSE_ES_MASK_PROB
+    ):
+        print(
+            f"Note: --sparse-es-mask-prob is ignored for --algo {algo} "
+            f"(sparse_open_es only)."
         )
     de_opts_nondefault = (
         float(args.de_f) != DEFAULT_DE_F
@@ -1154,6 +1173,8 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
         )
     if algo == "asebo":
         es_banner += f"  asebo_subspace_dims={args.asebo_subspace_dims}"
+    if algo == "sparse_open_es":
+        es_banner += f"  sparse_es_mask_prob={args.sparse_es_mask_prob}"
     if algo == "de":
         es_banner += (
             f"  de_f={args.de_f}  de_cr={args.de_cr}  de_elitism={args.de_elitism}"
@@ -1215,6 +1236,7 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
             es_sigma_scheduler=args.es_sigma_scheduler,
             es_sigma_end=args.es_sigma_end,
             asebo_subspace_dims=args.asebo_subspace_dims,
+            sparse_es_mask_prob=args.sparse_es_mask_prob,
             de_f=args.de_f,
             de_cr=args.de_cr,
             de_elitism=args.de_elitism,

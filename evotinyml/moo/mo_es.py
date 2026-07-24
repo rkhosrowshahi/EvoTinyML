@@ -1203,7 +1203,12 @@ def run_mgda_open_es(
             report_x=mean_opt.mean,
             report_F=mean_F,
         )
-        logger.maybe_validate(step=gen, n_eval=n_eval, center=mean_opt.mean)
+        logger.maybe_validate(
+            step=gen,
+            n_eval=n_eval,
+            center=mean_opt.mean,
+            force=(gen == steps),
+        )
 
     algo_name = "upgrad_open_es" if aggregator == "upgrad" else "mgda_open_es"
     return MOESResult(
@@ -1484,7 +1489,10 @@ def run_moead_open_es(
             report_F=means_F[best_center_i],
         )
         logger.maybe_validate(
-            step=gen, n_eval=n_eval, center=means_X[best_center_i]
+            step=gen,
+            n_eval=n_eval,
+            center=means_X[best_center_i],
+            force=(gen == steps),
         )
 
     # Final means evaluation for reporting and archive inclusion.

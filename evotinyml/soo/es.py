@@ -37,6 +37,7 @@ EVOSAX_SOO_ALGOS = {
     "snes": ("SNES", "SNES"),
     "xnes": ("xNES", "xNES"),
     "open_es": ("Open_ES", "OpenES"),
+    "sparse_open_es": ("SparseOpenES", "SparseOpenES"),
     "cr_fm_nes": ("CR_FM_NES", "CR-FM-NES"),
     "asebo": ("ASEBO", "ASEBO"),
     "lm_ma_es": ("LM_MA_ES", "LM-MA-ES"),
@@ -46,11 +47,11 @@ EVOSAX_SOO_ALGOS = {
 }
 
 # Algos that require an even population size (antithetic / paired sampling).
-EVEN_POPSIZE_ALGOS = frozenset({"open_es", "cr_fm_nes", "asebo"})
+EVEN_POPSIZE_ALGOS = frozenset({"open_es", "sparse_open_es", "cr_fm_nes", "asebo"})
 # Mean update via Optax (--es-optim*). Ignored for CMA / CR-FM-NES / LM-MA-ES / DE / jDE / PSO.
-MEAN_OPTIMIZER_ALGOS = frozenset({"open_es", "snes", "xnes", "asebo"})
+MEAN_OPTIMIZER_ALGOS = frozenset({"open_es", "sparse_open_es", "snes", "xnes", "asebo"})
 # Sampling-noise σ schedule (--es-sigma*).
-SIGMA_SCHEDULE_ALGOS = frozenset({"open_es", "asebo"})
+SIGMA_SCHEDULE_ALGOS = frozenset({"open_es", "sparse_open_es", "asebo"})
 # Population-based (init with evaluated population; report best member).
 POPULATION_BASED_ALGOS = frozenset({"de", "jde", "pso"})
 
@@ -65,10 +66,12 @@ DEFAULT_ES_OPTIM_MOMENTUM = 0.9
 # Weight decay for mean Optax update (0 = off). adamw uses Optax decoupled WD;
 # sgd / adam / rmsprop chain optax.add_decayed_weights when wd > 0.
 DEFAULT_ES_OPTIM_WD = 0.0
-# OpenES / ASEBO / MO-OpenES sampling-noise (σ) schedule over steps.
+# OpenES / SparseOpenES / ASEBO / MO-OpenES sampling-noise (σ) schedule over steps.
 ES_SIGMA_SCHEDULERS = ("constant", "cosine", "exponential")
 DEFAULT_ES_SIGMA_SCHEDULER = "constant"
 DEFAULT_ASEBO_SUBSPACE_DIMS = 1
+# SparseOpenES: fraction of isotropic-noise dims zeroed before antithetic sampling.
+DEFAULT_SPARSE_ES_MASK_PROB = 0.2
 # Differential Evolution (evosax defaults).
 DEFAULT_DE_F = 0.8
 DEFAULT_DE_CR = 0.9
@@ -354,6 +357,7 @@ def _build_evosax(
     es_sigma_scheduler: str = DEFAULT_ES_SIGMA_SCHEDULER,
     es_sigma_end: float | None = None,
     asebo_subspace_dims: int = DEFAULT_ASEBO_SUBSPACE_DIMS,
+    sparse_es_mask_prob: float = DEFAULT_SPARSE_ES_MASK_PROB,
     de_f: float = DEFAULT_DE_F,
     de_cr: float = DEFAULT_DE_CR,
     de_elitism: bool = DEFAULT_DE_ELITISM,
@@ -374,7 +378,7 @@ def _build_evosax(
 
     from evotinyml.soo.asebo_stable import StableASEBO
     from evotinyml.soo.jde import JDE
-    from evotinyml.soo.params_opt_es import OpenES, SNES, xNES
+    from evotinyml.soo.params_opt_es import OpenES, SNES, SparseOpenES, xNES
     from evotinyml.soo.pso_fixed import FixedPSO
 
     if algo not in EVOSAX_SOO_ALGOS:
@@ -387,6 +391,8 @@ def _build_evosax(
         Cls = StableASEBO
     elif algo == "open_es":
         Cls = OpenES
+    elif algo == "sparse_open_es":
+        Cls = SparseOpenES
     elif algo == "snes":
         Cls = SNES
     elif algo == "xnes":
@@ -437,6 +443,8 @@ def _build_evosax(
                 f"asebo_subspace_dims ({dims}) must be <= n_var ({n_var})"
             )
         kwargs["subspace_dims"] = dims
+    if algo == "sparse_open_es":
+        kwargs["mask_prob"] = float(sparse_es_mask_prob)
 
     es = Cls(**kwargs)
     params = es.default_params
@@ -514,6 +522,7 @@ def run_soo_es(
     es_sigma_scheduler: str = DEFAULT_ES_SIGMA_SCHEDULER,
     es_sigma_end: float | None = None,
     asebo_subspace_dims: int = DEFAULT_ASEBO_SUBSPACE_DIMS,
+    sparse_es_mask_prob: float = DEFAULT_SPARSE_ES_MASK_PROB,
     de_f: float = DEFAULT_DE_F,
     de_cr: float = DEFAULT_DE_CR,
     de_elitism: bool = DEFAULT_DE_ELITISM,
@@ -572,6 +581,7 @@ def run_soo_es(
         es_sigma_scheduler=es_sigma_scheduler,
         es_sigma_end=es_sigma_end,
         asebo_subspace_dims=asebo_subspace_dims,
+        sparse_es_mask_prob=sparse_es_mask_prob,
         de_f=de_f,
         de_cr=de_cr,
         de_elitism=de_elitism,
@@ -734,7 +744,7 @@ def run_soo_es(
                 opt_step=gen,
                 use_wandb=use_wandb,
                 verbose=verbose,
-                force=(gen == 1) or (gen % val_every == 0),
+                force=(gen == 1) or (gen % val_every == 0) or (gen == ask_steps),
                 solution_label="best" if population_based else "mean",
             )
 
@@ -872,6 +882,9 @@ def build_soo_wandb_config(
     asebo_subspace_dims = getattr(
         args, "asebo_subspace_dims", DEFAULT_ASEBO_SUBSPACE_DIMS
     )
+    sparse_es_mask_prob = getattr(
+        args, "sparse_es_mask_prob", DEFAULT_SPARSE_ES_MASK_PROB
+    )
     de_f = getattr(args, "de_f", DEFAULT_DE_F)
     de_cr = getattr(args, "de_cr", DEFAULT_DE_CR)
     de_elitism = getattr(args, "de_elitism", DEFAULT_DE_ELITISM)
@@ -914,6 +927,7 @@ def build_soo_wandb_config(
         "es_sigma_scheduler": es_sigma_scheduler,
         "es_sigma_end": es_sigma_end,
         "asebo_subspace_dims": asebo_subspace_dims,
+        "sparse_es_mask_prob": sparse_es_mask_prob,
         "de_f": de_f,
         "de_cr": de_cr,
         "de_elitism": de_elitism,
@@ -956,6 +970,7 @@ def build_soo_wandb_config(
             "es_sigma_scheduler": es_sigma_scheduler,
             "es_sigma_end": es_sigma_end,
             "asebo_subspace_dims": asebo_subspace_dims,
+            "sparse_es_mask_prob": sparse_es_mask_prob,
             "de_f": de_f,
             "de_cr": de_cr,
             "de_elitism": de_elitism,
