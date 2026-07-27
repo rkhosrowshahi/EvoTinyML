@@ -59,7 +59,7 @@ def parse_args() -> argparse.Namespace:
         help="Learning rate (default: 0.1 for SGD, 0.001 for Adam).",
     )
     parser.add_argument("--momentum", type=float, default=0.9, help="SGD momentum.")
-    parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay.")
+    parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay.")
     parser.add_argument("--seed", type=int, default=1, help="RNG seed.")
     parser.add_argument("--data-root", type=str, default="./data", help="Dataset cache root.")
     parser.add_argument(
