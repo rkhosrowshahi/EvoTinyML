@@ -66,9 +66,15 @@ DEFAULT_ES_OPTIM_MOMENTUM = 0.9
 # Weight decay for mean Optax update (0 = off). adamw uses Optax decoupled WD;
 # sgd / adam / rmsprop chain optax.add_decayed_weights when wd > 0.
 DEFAULT_ES_OPTIM_WD = 0.0
+# Exponential LR floor (staircase ×decay_rate every data-epoch).
+DEFAULT_ES_OPTIM_EXP_END = 1e-6
 # OpenES / SparseOpenES / ASEBO / MO-OpenES sampling-noise (σ) schedule over steps.
 ES_SIGMA_SCHEDULERS = ("constant", "cosine", "exponential")
 DEFAULT_ES_SIGMA_SCHEDULER = "constant"
+# Exponential σ / LR: staircase ×decay_rate every data-epoch (D // batch_size steps).
+DEFAULT_ES_SIGMA_DECAY_RATE = 0.9
+DEFAULT_ES_EPOCH_DECAY_RATE = DEFAULT_ES_SIGMA_DECAY_RATE
+DEFAULT_ES_SIGMA_EXP_END = 1e-6
 DEFAULT_ASEBO_SUBSPACE_DIMS = 1
 # SparseOpenES: fraction of isotropic-noise dims zeroed before antithetic sampling.
 DEFAULT_SPARSE_ES_MASK_PROB = 0.2
@@ -202,8 +208,20 @@ def _jde_control_means(state) -> dict[str, float]:
     }
 
 
-def _build_lr_schedule(scheduler: str, lr: float, steps: int):
-    """Optax learning-rate schedule for the OpenES mean optimizer."""
+def _build_lr_schedule(
+    scheduler: str,
+    lr: float,
+    steps: int,
+    steps_per_epoch: int | None = None,
+    decay_rate: float = DEFAULT_ES_EPOCH_DECAY_RATE,
+    end: float | None = None,
+):
+    """Optax learning-rate schedule for the OpenES mean optimizer.
+
+    ``exponential`` matches σ: staircase ×``decay_rate`` (default 0.9) every
+    data-epoch (``steps_per_epoch = n_train // batch_size``), floored at
+    ``end`` (default ``1e-6``).
+    """
     import optax
 
     name = scheduler.lower()
@@ -214,15 +232,43 @@ def _build_lr_schedule(scheduler: str, lr: float, steps: int):
     if name in {"cosine", "cosine_decay"}:
         return optax.cosine_decay_schedule(init_value=lr, decay_steps=decay_steps)
     if name in {"exponential", "exponential_decay"}:
+        if steps_per_epoch is None:
+            raise ValueError(
+                "exponential es_optim_scheduler requires steps_per_epoch "
+                "(n_train // batch_size)."
+            )
+        epoch_steps = max(int(steps_per_epoch), 1)
+        rate = float(decay_rate)
+        if not (0.0 < rate < 1.0):
+            raise ValueError(
+                f"es_optim decay_rate must be in (0, 1), got {rate}"
+            )
+        end_lr = (
+            DEFAULT_ES_OPTIM_EXP_END if end is None else max(float(end), 1e-12)
+        )
         return optax.exponential_decay(
             init_value=lr,
-            transition_steps=max(decay_steps // 10, 1),
-            decay_rate=0.99,
-            end_value=max(lr * 0.01, 1e-8),
+            transition_steps=epoch_steps,
+            decay_rate=rate,
+            staircase=True,
+            end_value=end_lr,
         )
     raise ValueError(
         f"Unknown es_optim_scheduler: {scheduler!r}. Use one of {ES_OPTIM_SCHEDULERS}."
     )
+
+
+def steps_per_data_epoch(n_train: int, batch_size: int) -> int:
+    """ES gens per data-epoch: ``max(1, n_train // batch_size)``."""
+    return max(1, int(n_train) // max(int(batch_size), 1))
+
+
+def steps_per_data_epoch_from_problem(problem: Any) -> int:
+    """Infer data-epoch length from the problem's eval batch sampler."""
+    sampler = getattr(problem, "batch_sampler", None)
+    if sampler is None:
+        raise ValueError("problem has no batch_sampler; cannot infer steps_per_epoch")
+    return steps_per_data_epoch(len(sampler.dataset), int(sampler.batch_size))
 
 
 def build_es_sigma_schedule(
@@ -230,33 +276,55 @@ def build_es_sigma_schedule(
     sigma: float = 0.1,
     steps: int = 1,
     end: float | None = None,
+    steps_per_epoch: int | None = None,
+    decay_rate: float = DEFAULT_ES_SIGMA_DECAY_RATE,
 ):
     """Optax schedule for OpenES sampling std σ over optimization steps.
 
-    ``end`` defaults to ``max(sigma * 0.01, 1e-6)`` for cosine / exponential
-    (constant ignores ``end``). Cosine uses ``alpha = end / sigma``.
+    * ``constant`` — ignore ``end`` / ``steps_per_epoch``.
+    * ``cosine`` — anneal to ``end`` (default ``max(sigma * 0.01, 1e-6)``)
+      over ``steps``.
+    * ``exponential`` — staircase: hold σ for one data-epoch
+      (``steps_per_epoch = n_train // batch_size`` gens), then multiply by
+      ``decay_rate`` (default 0.9). Floor at ``end`` (default ``1e-6``).
     """
     import optax
 
     name = scheduler.lower()
     sigma = float(sigma)
     decay_steps = max(int(steps), 1)
-    if end is None:
-        end_sigma = max(sigma * 0.01, 1e-6)
-    else:
-        end_sigma = max(float(end), 1e-12)
     if name == "constant":
         return optax.constant_schedule(sigma)
     if name in {"cosine", "cosine_decay"}:
+        if end is None:
+            end_sigma = max(sigma * 0.01, 1e-6)
+        else:
+            end_sigma = max(float(end), 1e-12)
         alpha = float(np.clip(end_sigma / max(sigma, 1e-12), 0.0, 1.0))
         return optax.cosine_decay_schedule(
             init_value=sigma, decay_steps=decay_steps, alpha=alpha
         )
     if name in {"exponential", "exponential_decay"}:
+        if end is None:
+            end_sigma = DEFAULT_ES_SIGMA_EXP_END
+        else:
+            end_sigma = max(float(end), 1e-12)
+        if steps_per_epoch is None:
+            raise ValueError(
+                "exponential es_sigma_scheduler requires steps_per_epoch "
+                "(n_train // batch_size)."
+            )
+        epoch_steps = max(int(steps_per_epoch), 1)
+        rate = float(decay_rate)
+        if not (0.0 < rate < 1.0):
+            raise ValueError(
+                f"es_sigma decay_rate must be in (0, 1), got {rate}"
+            )
         return optax.exponential_decay(
             init_value=sigma,
-            transition_steps=max(decay_steps // 10, 1),
-            decay_rate=0.99,
+            transition_steps=epoch_steps,
+            decay_rate=rate,
+            staircase=True,
             end_value=end_sigma,
         )
     raise ValueError(
@@ -278,12 +346,15 @@ def build_open_es_optimizer(
     steps: int = 1,
     momentum: float = DEFAULT_ES_OPTIM_MOMENTUM,
     weight_decay: float = DEFAULT_ES_OPTIM_WD,
+    steps_per_epoch: int | None = None,
 ):
     """Build the Optax transform used to update the OpenES mean."""
     import optax
 
     name = optim.lower()
-    schedule = _build_lr_schedule(scheduler, lr, steps)
+    schedule = _build_lr_schedule(
+        scheduler, lr, steps, steps_per_epoch=steps_per_epoch
+    )
     mom = float(momentum)
     wd = float(weight_decay)
     # optax: momentum=None disables the velocity buffer (sgd / rmsprop).
@@ -354,8 +425,10 @@ def _build_evosax(
     es_optim_scheduler: str = DEFAULT_ES_OPTIM_SCHEDULER,
     es_optim_momentum: float = DEFAULT_ES_OPTIM_MOMENTUM,
     es_optim_wd: float = DEFAULT_ES_OPTIM_WD,
+    es_optim_steps_per_epoch: int | None = None,
     es_sigma_scheduler: str = DEFAULT_ES_SIGMA_SCHEDULER,
     es_sigma_end: float | None = None,
+    es_sigma_steps_per_epoch: int | None = None,
     asebo_subspace_dims: int = DEFAULT_ASEBO_SUBSPACE_DIMS,
     sparse_es_mask_prob: float = DEFAULT_SPARSE_ES_MASK_PROB,
     de_f: float = DEFAULT_DE_F,
@@ -429,10 +502,15 @@ def _build_evosax(
             steps=steps,
             momentum=es_optim_momentum,
             weight_decay=es_optim_wd,
+            steps_per_epoch=es_optim_steps_per_epoch,
         )
     if algo in SIGMA_SCHEDULE_ALGOS:
         kwargs["std_schedule"] = build_es_sigma_schedule(
-            es_sigma_scheduler, sigma, steps=steps, end=es_sigma_end
+            es_sigma_scheduler,
+            sigma,
+            steps=steps,
+            end=es_sigma_end,
+            steps_per_epoch=es_sigma_steps_per_epoch,
         )
     if algo == "asebo":
         dims = int(asebo_subspace_dims)
@@ -519,8 +597,10 @@ def run_soo_es(
     es_optim_scheduler: str = DEFAULT_ES_OPTIM_SCHEDULER,
     es_optim_momentum: float = DEFAULT_ES_OPTIM_MOMENTUM,
     es_optim_wd: float = DEFAULT_ES_OPTIM_WD,
+    es_optim_steps_per_epoch: int | None = None,
     es_sigma_scheduler: str = DEFAULT_ES_SIGMA_SCHEDULER,
     es_sigma_end: float | None = None,
+    es_sigma_steps_per_epoch: int | None = None,
     asebo_subspace_dims: int = DEFAULT_ASEBO_SUBSPACE_DIMS,
     sparse_es_mask_prob: float = DEFAULT_SPARSE_ES_MASK_PROB,
     de_f: float = DEFAULT_DE_F,
@@ -567,6 +647,31 @@ def run_soo_es(
     if steps < 0:
         raise ValueError(f"steps must be >= 0, got {steps}")
 
+    needs_epoch = False
+    if algo in SIGMA_SCHEDULE_ALGOS and es_sigma_scheduler.lower() in {
+        "exponential",
+        "exponential_decay",
+    }:
+        needs_epoch = True
+    if algo in MEAN_OPTIMIZER_ALGOS and es_optim_scheduler.lower() in {
+        "exponential",
+        "exponential_decay",
+    }:
+        needs_epoch = True
+    epoch_steps = (
+        steps_per_data_epoch_from_problem(problem) if needs_epoch else None
+    )
+    sigma_steps_per_epoch = (
+        es_sigma_steps_per_epoch
+        if es_sigma_steps_per_epoch is not None
+        else epoch_steps
+    )
+    optim_steps_per_epoch = (
+        es_optim_steps_per_epoch
+        if es_optim_steps_per_epoch is not None
+        else epoch_steps
+    )
+
     es, params, popsize, display_name = _build_evosax(
         algo,
         popsize,
@@ -578,8 +683,10 @@ def run_soo_es(
         es_optim_scheduler=es_optim_scheduler,
         es_optim_momentum=es_optim_momentum,
         es_optim_wd=es_optim_wd,
+        es_optim_steps_per_epoch=optim_steps_per_epoch,
         es_sigma_scheduler=es_sigma_scheduler,
         es_sigma_end=es_sigma_end,
+        es_sigma_steps_per_epoch=sigma_steps_per_epoch,
         asebo_subspace_dims=asebo_subspace_dims,
         sparse_es_mask_prob=sparse_es_mask_prob,
         de_f=de_f,
@@ -599,9 +706,23 @@ def run_soo_es(
     )
     sigma_schedule = (
         build_es_sigma_schedule(
-            es_sigma_scheduler, init_sigma, steps=steps, end=es_sigma_end
+            es_sigma_scheduler,
+            init_sigma,
+            steps=steps,
+            end=es_sigma_end,
+            steps_per_epoch=sigma_steps_per_epoch,
         )
         if algo in SIGMA_SCHEDULE_ALGOS
+        else None
+    )
+    lr_schedule = (
+        _build_lr_schedule(
+            es_optim_scheduler,
+            es_optim_lr,
+            steps=steps,
+            steps_per_epoch=optim_steps_per_epoch,
+        )
+        if algo in MEAN_OPTIMIZER_ALGOS
         else None
     )
 
@@ -675,6 +796,7 @@ def run_soo_es(
         label="init",
         pop_best_f=init_pop_best,
         es_sigma=float(init_sigma) if algo in SIGMA_SCHEDULE_ALGOS else None,
+        es_lr=sigma_at(lr_schedule, 0) if lr_schedule is not None else None,
         solution_label="best" if population_based else "mean",
     )
     if test_loader is not None and val_every > 0:
@@ -720,6 +842,7 @@ def run_soo_es(
         cur_sigma = (
             sigma_at(sigma_schedule, gen - 1) if sigma_schedule is not None else None
         )
+        cur_lr = sigma_at(lr_schedule, gen - 1) if lr_schedule is not None else None
         _log_soo_step(
             step=gen,
             n_eval=n_eval,
@@ -731,6 +854,7 @@ def run_soo_es(
             label=f"step {gen}",
             pop_best_f=pop_best_f,
             es_sigma=cur_sigma,
+            es_lr=cur_lr,
             solution_label="best" if population_based else "mean",
         )
 
@@ -781,6 +905,7 @@ def _log_soo_step(
     label: str,
     pop_best_f: float | None = None,
     es_sigma: float | None = None,
+    es_lr: float | None = None,
     solution_label: str = "mean",
 ) -> None:
     extra = _format_details(details)
@@ -792,6 +917,8 @@ def _log_soo_step(
             msg += f"  pop_best_f={pop_best_f:.6f}"
         if es_sigma is not None:
             msg += f"  es_sigma={es_sigma:.6f}"
+        if es_lr is not None:
+            msg += f"  es_lr={es_lr:.6f}"
         print(msg)
     if use_wandb:
         payload: dict[str, Any] = {
@@ -805,6 +932,8 @@ def _log_soo_step(
             payload["train/pop_best_f"] = pop_best_f
         if es_sigma is not None:
             payload["train/es_sigma"] = float(es_sigma)
+        if es_lr is not None:
+            payload["train/es_lr"] = float(es_lr)
         for key, value in details.items():
             if key == "f":
                 continue

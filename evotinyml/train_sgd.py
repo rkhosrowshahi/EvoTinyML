@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
         help="Hidden activation: relu or tanh.",
     )
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
-    parser.add_argument("--batch-size", type=int, default=128, help="Mini-batch size.")
+    parser.add_argument("--batch-size", type=int, default=256, help="Mini-batch size.")
     parser.add_argument(
         "--lr",
         type=float,
@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device",
         type=str,
-        default="cpu",
+        default="gpu",
         help=(
             "Torch device: cpu, cuda, mps, or gpu "
             "(gpu → CUDA if available, else MPS)."

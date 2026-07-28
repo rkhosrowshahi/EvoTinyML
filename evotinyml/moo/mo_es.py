@@ -55,10 +55,12 @@ from evotinyml.soo.es import (
     DEFAULT_ES_OPTIM_WD,
     DEFAULT_ES_SIGMA_SCHEDULER,
     _init_mean,
+    _build_lr_schedule,
     build_es_sigma_schedule,
     build_open_es_optimizer,
     default_soo_popsize,
     sigma_at,
+    steps_per_data_epoch_from_problem,
 )
 from evotinyml.validation import (
     class_metric_log_dict,
@@ -240,6 +242,7 @@ class _MeanOptimizer:
         es_optim_momentum: float,
         es_optim_wd: float,
         steps: int,
+        steps_per_epoch: int | None = None,
     ) -> None:
         import jax.numpy as jnp
 
@@ -253,6 +256,7 @@ class _MeanOptimizer:
             steps=steps,
             momentum=es_optim_momentum,
             weight_decay=es_optim_wd,
+            steps_per_epoch=steps_per_epoch,
         )
         self.mean = np.clip(np.asarray(mean0, dtype=np.float64), self.xl, self.xu)
         self._opt_state = self._optimizer.init(jnp.asarray(self.mean, dtype=jnp.float32))
@@ -1045,8 +1049,25 @@ def run_mgda_open_es(
         popsize += 1
 
     sigma0 = float(init_sigma)
+    needs_epoch = es_sigma_scheduler.lower() in {
+        "exponential",
+        "exponential_decay",
+    } or es_optim_scheduler.lower() in {"exponential", "exponential_decay"}
+    epoch_steps = (
+        steps_per_data_epoch_from_problem(problem) if needs_epoch else None
+    )
     sigma_schedule = build_es_sigma_schedule(
-        es_sigma_scheduler, sigma0, steps=steps, end=es_sigma_end
+        es_sigma_scheduler,
+        sigma0,
+        steps=steps,
+        end=es_sigma_end,
+        steps_per_epoch=epoch_steps,
+    )
+    lr_schedule = _build_lr_schedule(
+        es_optim_scheduler,
+        es_optim_lr,
+        steps=steps,
+        steps_per_epoch=epoch_steps,
     )
     import jax
     import jax.numpy as jnp
@@ -1068,6 +1089,7 @@ def run_mgda_open_es(
         es_optim_momentum=es_optim_momentum,
         es_optim_wd=es_optim_wd,
         steps=steps,
+        steps_per_epoch=epoch_steps,
     )
     archive = NDArchive(
         problem,
@@ -1098,6 +1120,7 @@ def run_mgda_open_es(
     init_extra: dict[str, float] = {
         "center_f": float(mean_F.mean()),
         "es_sigma": sigma0,
+        "es_lr": sigma_at(lr_schedule, 0),
     }
     if getattr(problem, "problem_name", "") in L1_PROBLEMS and mean_F.size >= 2:
         init_extra["l1"] = float(mean_F[1])
@@ -1117,6 +1140,7 @@ def run_mgda_open_es(
 
     for gen in range(1, steps + 1):
         sigma = sigma_at(sigma_schedule, gen - 1)
+        lr = sigma_at(lr_schedule, gen - 1)
         mean = jnp.asarray(mean_opt.mean)
         key, eps = _antithetic_noise(key, popsize // 2, n_var)
         X = jnp.clip(mean[None, :] + sigma * eps, xl, xu)
@@ -1198,6 +1222,7 @@ def run_mgda_open_es(
                 "mgda_w_max": float(np.max(np.asarray(w))),
                 "mgda_w_min": float(np.min(np.asarray(w))),
                 "es_sigma": float(sigma),
+                "es_lr": float(lr),
             },
             label=f"step {gen}",
             report_x=mean_opt.mean,
@@ -1314,8 +1339,25 @@ def run_moead_open_es(
     import jax.numpy as jnp
 
     sigma0 = float(init_sigma)
+    needs_epoch = es_sigma_scheduler.lower() in {
+        "exponential",
+        "exponential_decay",
+    } or es_optim_scheduler.lower() in {"exponential", "exponential_decay"}
+    epoch_steps = (
+        steps_per_data_epoch_from_problem(problem) if needs_epoch else None
+    )
     sigma_schedule = build_es_sigma_schedule(
-        es_sigma_scheduler, sigma0, steps=steps, end=es_sigma_end
+        es_sigma_scheduler,
+        sigma0,
+        steps=steps,
+        end=es_sigma_end,
+        steps_per_epoch=epoch_steps,
+    )
+    lr_schedule = _build_lr_schedule(
+        es_optim_scheduler,
+        es_optim_lr,
+        steps=steps,
+        steps_per_epoch=epoch_steps,
     )
     xl = float(np.asarray(problem.xl).reshape(-1)[0]) if problem.xl is not None else -10.0
     xu = float(np.asarray(problem.xu).reshape(-1)[0]) if problem.xu is not None else 10.0
@@ -1335,6 +1377,7 @@ def run_moead_open_es(
             es_optim_momentum=es_optim_momentum,
             es_optim_wd=es_optim_wd,
             steps=steps,
+            steps_per_epoch=epoch_steps,
         )
         for _ in range(k)
     ]
@@ -1400,6 +1443,7 @@ def run_moead_open_es(
                 )
             ),
             "es_sigma": sigma0,
+            "es_lr": sigma_at(lr_schedule, 0),
             "center_f": float(means_F[best_center_i].mean()),
         },
         label="init",
@@ -1415,6 +1459,7 @@ def run_moead_open_es(
         # Sample and evaluate all subpopulations first so the ideal point
         # update is shared within the generation.
         sigma = sigma_at(sigma_schedule, gen - 1)
+        lr = sigma_at(lr_schedule, gen - 1)
         # One shared fitness batch for all means this generation (CRN).
         problem.sample_eval_pool()
         X_all: list[np.ndarray] = []
@@ -1482,6 +1527,7 @@ def run_moead_open_es(
                 "tcheby_mean": float(tcheby_bests.mean()),
                 "tcheby_max": float(tcheby_bests.max()),
                 "es_sigma": float(sigma),
+                "es_lr": float(lr),
                 "center_f": float(means_F[best_center_i].mean()),
             },
             label=f"step {gen}",

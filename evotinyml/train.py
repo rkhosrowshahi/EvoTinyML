@@ -327,8 +327,10 @@ def parse_args() -> argparse.Namespace:
         choices=ES_OPTIM_SCHEDULERS,
         default=DEFAULT_ES_OPTIM_SCHEDULER,
         help=(
-            "LR schedule over steps for open_es / sparse_open_es / snes / xnes / asebo: constant, "
-            "cosine (decay to 0 over steps), or exponential. "
+            "LR schedule over steps for open_es / sparse_open_es / snes / xnes / asebo: "
+            "constant, cosine (decay to 0 over steps), or exponential "
+            "(staircase ×0.9 every data-epoch = n_train // batch_size gens, "
+            "floor 1e-6; same as --es-sigma-scheduler exponential). "
             "Ignored for cmaes / cr_fm_nes / lm_ma_es / de / jde / pso."
         ),
     )
@@ -360,6 +362,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "OpenES / SparseOpenES / ASEBO / MO-OpenES sampling-noise (σ) schedule over steps: "
             "constant, cosine, or exponential. Start value is --init-sigma. "
+            "exponential: staircase ×0.9 every data-epoch (n_train // batch_size gens), "
+            "floored at --es-sigma-end (default 1e-6). "
             "Ignored for cmaes / snes / xnes / cr_fm_nes / lm_ma_es / de / jde / pso."
         ),
     )
@@ -368,8 +372,9 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help=(
-            "Final σ for cosine / exponential --es-sigma-scheduler "
-            "(default: max(0.01 * init_sigma, 1e-6)). "
+            "Final σ floor for cosine / exponential --es-sigma-scheduler "
+            "(cosine default: max(0.01 * init_sigma, 1e-6); "
+            "exponential default: 1e-6). "
             "Ignored for constant / non-scheduled algos."
         ),
     )
@@ -1176,6 +1181,13 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
             f"es_optim_momentum={args.es_optim_momentum}  "
             f"es_optim_wd={args.es_optim_wd}"
         )
+        if args.es_optim_scheduler == "exponential":
+            n_train = len(batch_sampler.dataset)
+            spe = max(1, n_train // int(args.batch_size))
+            es_banner += (
+                f"  es_lr_decay=0.9/epoch  "
+                f"steps_per_epoch={spe} (n_train={n_train})"
+            )
     if uses_sigma_schedule:
         end_str = (
             f"{args.es_sigma_end}" if args.es_sigma_end is not None else "default"
@@ -1184,6 +1196,13 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
             f"  es_sigma_scheduler={args.es_sigma_scheduler}  "
             f"es_sigma_end={end_str}"
         )
+        if args.es_sigma_scheduler == "exponential":
+            n_train = len(batch_sampler.dataset)
+            spe = max(1, n_train // int(args.batch_size))
+            es_banner += (
+                f"  es_sigma_decay=0.9/epoch  "
+                f"steps_per_epoch={spe} (n_train={n_train})"
+            )
     if algo == "asebo":
         es_banner += f"  asebo_subspace_dims={args.asebo_subspace_dims}"
     if algo == "sparse_open_es":
@@ -1402,9 +1421,21 @@ def run_mo_es(args: argparse.Namespace, problem, test_loader, num_classes: int, 
         f"es_optim_scheduler={args.es_optim_scheduler}  "
         f"es_optim_momentum={args.es_optim_momentum}  "
         f"es_optim_wd={args.es_optim_wd}  "
-        f"es_sigma_scheduler={args.es_sigma_scheduler}  "
+        + (
+            f"es_lr_decay=0.9/epoch  "
+            f"steps_per_epoch={max(1, len(batch_sampler.dataset) // int(args.batch_size))}  "
+            if args.es_optim_scheduler == "exponential"
+            else ""
+        )
+        + f"es_sigma_scheduler={args.es_sigma_scheduler}  "
         f"es_sigma_end={args.es_sigma_end if args.es_sigma_end is not None else 'default'}  "
-        f"archive={args.archive_selection}({args.archive_size})"
+        + (
+            f"es_sigma_decay=0.9/epoch  "
+            f"steps_per_epoch={max(1, len(batch_sampler.dataset) // int(args.batch_size))}  "
+            if args.es_sigma_scheduler == "exponential"
+            else ""
+        )
+        + f"archive={args.archive_selection}({args.archive_size})"
         f"{mgda_banner}{moead_banner}  "
         f"batch_size={args.batch_size}  eval_mode={args.eval_mode}  "
         f"eval_batches={problem.eval_batches}  "
