@@ -50,6 +50,8 @@ from evotinyml.soo.es import (
     DEFAULT_ES_OPTIM_MOMENTUM,
     DEFAULT_ES_OPTIM_SCHEDULER,
     DEFAULT_ES_OPTIM_WD,
+    DEFAULT_ES_SIGMA_MAX_RATIO,
+    DEFAULT_ES_SIGMA_MIN_RATIO,
     DEFAULT_ES_SIGMA_SCHEDULER,
     DEFAULT_JDE_CR_INIT,
     DEFAULT_JDE_ELITISM,
@@ -63,6 +65,7 @@ from evotinyml.soo.es import (
     DEFAULT_PSO_MAX_VELOCITY,
     DEFAULT_PSO_SOCIAL,
     DEFAULT_SPARSE_ES_MASK_PROB,
+    ADAPTIVE_SIGMA_ALGOS,
     ES_OPTIMS,
     ES_OPTIM_SCHEDULERS,
     ES_SIGMA_SCHEDULERS,
@@ -182,7 +185,8 @@ def parse_args() -> argparse.Namespace:
         default="nsga2",
         help=(
             "Optimizer: nsga2 / nsga3 (MOO), cmaes / snes / xnes / open_es / "
-            "sparse_open_es / cr_fm_nes / asebo / lm_ma_es / de / jde / pso "
+            "sparse_open_es / ada_open_es / cr_fm_nes / asebo / lm_ma_es / de / "
+            "jde / pso "
             "(SOO: ERM or weighted-sum scalarization of any MOO problem), "
             "or mgda_open_es / upgrad_open_es / moead_open_es "
             "(multi-objective OpenES on vector problems, e.g. cwrm_cross_entropy)."
@@ -376,6 +380,37 @@ def parse_args() -> argparse.Namespace:
             "(cosine default: max(0.01 * init_sigma, 1e-6); "
             "exponential default: 1e-6). "
             "Ignored for constant / non-scheduled algos."
+        ),
+    )
+    parser.add_argument(
+        "--es-sigma-lr",
+        type=float,
+        default=None,
+        help=(
+            "ada_open_es: learning rate for the per-parameter log-σ natural-"
+            "gradient update. Default: auto, SNES's dimension-scaled rate "
+            "(3 + ln(n_var)) / (5 * sqrt(n_var)) (no manual tuning needed as "
+            "model size changes). Ignored for other algos."
+        ),
+    )
+    parser.add_argument(
+        "--es-sigma-min",
+        type=float,
+        default=None,
+        help=(
+            "ada_open_es: floor clip for each per-parameter σ, guards against "
+            f"collapse. Default: auto, --init-sigma × {DEFAULT_ES_SIGMA_MIN_RATIO}. "
+            "Ignored for other algos."
+        ),
+    )
+    parser.add_argument(
+        "--es-sigma-max",
+        type=float,
+        default=None,
+        help=(
+            "ada_open_es: ceiling clip for each per-parameter σ, guards "
+            f"against blow-up. Default: auto, --init-sigma × {DEFAULT_ES_SIGMA_MAX_RATIO}. "
+            "Ignored for other algos."
         ),
     )
     parser.add_argument(
@@ -1102,6 +1137,17 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
             f"Note: --es-sigma-scheduler / --es-sigma-end are ignored for "
             f"--algo {algo} (open_es / sparse_open_es / asebo only)."
         )
+    uses_adaptive_sigma = algo in ADAPTIVE_SIGMA_ALGOS
+    adasigma_opts_nondefault = (
+        args.es_sigma_lr is not None
+        or args.es_sigma_min is not None
+        or args.es_sigma_max is not None
+    )
+    if not uses_adaptive_sigma and adasigma_opts_nondefault:
+        print(
+            f"Note: --es-sigma-lr / --es-sigma-min / --es-sigma-max are "
+            f"ignored for --algo {algo} (ada_open_es only)."
+        )
     if (
         algo != "asebo"
         and int(args.asebo_subspace_dims) != DEFAULT_ASEBO_SUBSPACE_DIMS
@@ -1207,6 +1253,23 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
         es_banner += f"  asebo_subspace_dims={args.asebo_subspace_dims}"
     if algo == "sparse_open_es":
         es_banner += f"  sparse_es_mask_prob={args.sparse_es_mask_prob}"
+    if algo == "ada_open_es":
+        sigma_lr_str = args.es_sigma_lr if args.es_sigma_lr is not None else "auto"
+        sigma_min_str = (
+            args.es_sigma_min
+            if args.es_sigma_min is not None
+            else f"auto({DEFAULT_ES_SIGMA_MIN_RATIO}×sigma)"
+        )
+        sigma_max_str = (
+            args.es_sigma_max
+            if args.es_sigma_max is not None
+            else f"auto({DEFAULT_ES_SIGMA_MAX_RATIO}×sigma)"
+        )
+        es_banner += (
+            f"  es_sigma_lr={sigma_lr_str}  "
+            f"es_sigma_min={sigma_min_str}  "
+            f"es_sigma_max={sigma_max_str}"
+        )
     if algo == "de":
         es_banner += (
             f"  de_f={args.de_f}  de_cr={args.de_cr}  de_elitism={args.de_elitism}"
@@ -1267,6 +1330,9 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
             es_optim_wd=args.es_optim_wd,
             es_sigma_scheduler=args.es_sigma_scheduler,
             es_sigma_end=args.es_sigma_end,
+            es_sigma_lr=args.es_sigma_lr,
+            es_sigma_min=args.es_sigma_min,
+            es_sigma_max=args.es_sigma_max,
             asebo_subspace_dims=args.asebo_subspace_dims,
             sparse_es_mask_prob=args.sparse_es_mask_prob,
             de_f=args.de_f,
@@ -1331,6 +1397,9 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
             es_optim_wd=args.es_optim_wd,
             es_sigma_scheduler=args.es_sigma_scheduler,
             es_sigma_end=args.es_sigma_end if args.es_sigma_end is not None else -1.0,
+            es_sigma_lr=args.es_sigma_lr if args.es_sigma_lr is not None else -1.0,
+            es_sigma_min=args.es_sigma_min if args.es_sigma_min is not None else -1.0,
+            es_sigma_max=args.es_sigma_max if args.es_sigma_max is not None else -1.0,
             steps=args.steps,
             popsize=result.popsize,
             fitness=result.fitness_name,

@@ -38,6 +38,7 @@ EVOSAX_SOO_ALGOS = {
     "xnes": ("xNES", "xNES"),
     "open_es": ("Open_ES", "OpenES"),
     "sparse_open_es": ("SparseOpenES", "SparseOpenES"),
+    "ada_open_es": ("AdaOpenES", "AdaOpenES"),
     "cr_fm_nes": ("CR_FM_NES", "CR-FM-NES"),
     "asebo": ("ASEBO", "ASEBO"),
     "lm_ma_es": ("LM_MA_ES", "LM-MA-ES"),
@@ -47,11 +48,17 @@ EVOSAX_SOO_ALGOS = {
 }
 
 # Algos that require an even population size (antithetic / paired sampling).
-EVEN_POPSIZE_ALGOS = frozenset({"open_es", "sparse_open_es", "cr_fm_nes", "asebo"})
+EVEN_POPSIZE_ALGOS = frozenset(
+    {"open_es", "sparse_open_es", "ada_open_es", "cr_fm_nes", "asebo"}
+)
 # Mean update via Optax (--es-optim*). Ignored for CMA / CR-FM-NES / LM-MA-ES / DE / jDE / PSO.
-MEAN_OPTIMIZER_ALGOS = frozenset({"open_es", "sparse_open_es", "snes", "xnes", "asebo"})
+MEAN_OPTIMIZER_ALGOS = frozenset(
+    {"open_es", "sparse_open_es", "ada_open_es", "snes", "xnes", "asebo"}
+)
 # Sampling-noise σ schedule (--es-sigma*).
 SIGMA_SCHEDULE_ALGOS = frozenset({"open_es", "sparse_open_es", "asebo"})
+# Self-adapted per-parameter σ (no schedule; --es-sigma-lr/-min/-max instead).
+ADAPTIVE_SIGMA_ALGOS = frozenset({"ada_open_es"})
 # Population-based (init with evaluated population; report best member).
 POPULATION_BASED_ALGOS = frozenset({"de", "jde", "pso"})
 
@@ -75,6 +82,10 @@ DEFAULT_ES_SIGMA_SCHEDULER = "constant"
 DEFAULT_ES_SIGMA_DECAY_RATE = 0.9
 DEFAULT_ES_EPOCH_DECAY_RATE = DEFAULT_ES_SIGMA_DECAY_RATE
 DEFAULT_ES_SIGMA_EXP_END = 1e-6
+# AdaOpenES: --es-sigma-lr default is SNES's dimension-scaled rate
+# (3 + ln d) / (5 sqrt d); --es-sigma-min/-max default to init_sigma × these ratios.
+DEFAULT_ES_SIGMA_MIN_RATIO = 0.01
+DEFAULT_ES_SIGMA_MAX_RATIO = 100.0
 DEFAULT_ASEBO_SUBSPACE_DIMS = 1
 # SparseOpenES: fraction of isotropic-noise dims zeroed before antithetic sampling.
 DEFAULT_SPARSE_ES_MASK_PROB = 0.2
@@ -206,6 +217,31 @@ def _jde_control_means(state) -> dict[str, float]:
         "jde_std_f": float(np.std(f)),
         "jde_std_cr": float(np.std(cr)),
     }
+
+
+def _ada_sigma_stats(state) -> dict[str, float]:
+    """Summary of AdaOpenES's self-adapted per-parameter σ vector."""
+    std = np.asarray(state.std, dtype=np.float64)
+    return {
+        "sigma_mean": float(np.mean(std)),
+        "sigma_min": float(np.min(std)),
+        "sigma_max": float(np.max(std)),
+        "sigma_std": float(np.std(std)),
+    }
+
+
+def _current_sigma_scalar(
+    algo: str,
+    state,
+    sigma_schedule,
+    gen: int,
+) -> float | None:
+    """Representative scalar σ for verbose/W&B logging (schedule or adapted mean)."""
+    if algo in ADAPTIVE_SIGMA_ALGOS:
+        return float(np.mean(np.asarray(state.std, dtype=np.float64)))
+    if sigma_schedule is not None:
+        return sigma_at(sigma_schedule, gen)
+    return None
 
 
 def _build_lr_schedule(
@@ -429,6 +465,9 @@ def _build_evosax(
     es_sigma_scheduler: str = DEFAULT_ES_SIGMA_SCHEDULER,
     es_sigma_end: float | None = None,
     es_sigma_steps_per_epoch: int | None = None,
+    es_sigma_lr: float | None = None,
+    es_sigma_min: float | None = None,
+    es_sigma_max: float | None = None,
     asebo_subspace_dims: int = DEFAULT_ASEBO_SUBSPACE_DIMS,
     sparse_es_mask_prob: float = DEFAULT_SPARSE_ES_MASK_PROB,
     de_f: float = DEFAULT_DE_F,
@@ -451,7 +490,13 @@ def _build_evosax(
 
     from evotinyml.soo.asebo_stable import StableASEBO
     from evotinyml.soo.jde import JDE
-    from evotinyml.soo.params_opt_es import OpenES, SNES, SparseOpenES, xNES
+    from evotinyml.soo.params_opt_es import (
+        AdaOpenES,
+        OpenES,
+        SNES,
+        SparseOpenES,
+        xNES,
+    )
     from evotinyml.soo.pso_fixed import FixedPSO
 
     if algo not in EVOSAX_SOO_ALGOS:
@@ -466,6 +511,8 @@ def _build_evosax(
         Cls = OpenES
     elif algo == "sparse_open_es":
         Cls = SparseOpenES
+    elif algo == "ada_open_es":
+        Cls = AdaOpenES
     elif algo == "snes":
         Cls = SNES
     elif algo == "xnes":
@@ -528,6 +575,31 @@ def _build_evosax(
     params = es.default_params
     if algo not in SIGMA_SCHEDULE_ALGOS and hasattr(params, "std_init"):
         params = params.replace(std_init=sigma)
+    if algo == "ada_open_es":
+        ada_sigma_lr = (
+            float(es_sigma_lr) if es_sigma_lr is not None else float(params.sigma_lr_init)
+        )
+        ada_sigma_min = (
+            float(es_sigma_min)
+            if es_sigma_min is not None
+            else sigma * DEFAULT_ES_SIGMA_MIN_RATIO
+        )
+        ada_sigma_max = (
+            float(es_sigma_max)
+            if es_sigma_max is not None
+            else sigma * DEFAULT_ES_SIGMA_MAX_RATIO
+        )
+        if ada_sigma_lr <= 0.0:
+            raise ValueError(f"es_sigma_lr must be > 0, got {ada_sigma_lr}")
+        if ada_sigma_min <= 0.0:
+            raise ValueError(f"es_sigma_min must be > 0, got {ada_sigma_min}")
+        if ada_sigma_max <= ada_sigma_min:
+            raise ValueError(
+                f"es_sigma_max ({ada_sigma_max}) must be > es_sigma_min ({ada_sigma_min})"
+            )
+        params = params.replace(
+            sigma_lr_init=ada_sigma_lr, sigma_min=ada_sigma_min, sigma_max=ada_sigma_max
+        )
     if algo == "lm_ma_es":
         params = _fix_lm_ma_es_c_c(es, params, population_size, n_var)
     if algo == "de":
@@ -601,6 +673,9 @@ def run_soo_es(
     es_sigma_scheduler: str = DEFAULT_ES_SIGMA_SCHEDULER,
     es_sigma_end: float | None = None,
     es_sigma_steps_per_epoch: int | None = None,
+    es_sigma_lr: float | None = None,
+    es_sigma_min: float | None = None,
+    es_sigma_max: float | None = None,
     asebo_subspace_dims: int = DEFAULT_ASEBO_SUBSPACE_DIMS,
     sparse_es_mask_prob: float = DEFAULT_SPARSE_ES_MASK_PROB,
     de_f: float = DEFAULT_DE_F,
@@ -687,6 +762,9 @@ def run_soo_es(
         es_sigma_scheduler=es_sigma_scheduler,
         es_sigma_end=es_sigma_end,
         es_sigma_steps_per_epoch=sigma_steps_per_epoch,
+        es_sigma_lr=es_sigma_lr,
+        es_sigma_min=es_sigma_min,
+        es_sigma_max=es_sigma_max,
         asebo_subspace_dims=asebo_subspace_dims,
         sparse_es_mask_prob=sparse_es_mask_prob,
         de_f=de_f,
@@ -781,6 +859,8 @@ def run_soo_es(
         sol_x = _state_solution(algo, state, xl, xu)
         sol_details = soo.evaluate_one(sol_x)
         sol_details.update(_maybe_ce_train_details(problem, sol_x))
+        if algo in ADAPTIVE_SIGMA_ALGOS:
+            sol_details.update(_ada_sigma_stats(state))
         sol_f = float(sol_details["f"])
         init_pop_best = None
 
@@ -795,7 +875,7 @@ def run_soo_es(
         verbose=verbose,
         label="init",
         pop_best_f=init_pop_best,
-        es_sigma=float(init_sigma) if algo in SIGMA_SCHEDULE_ALGOS else None,
+        es_sigma=_current_sigma_scalar(algo, state, sigma_schedule, 0),
         es_lr=sigma_at(lr_schedule, 0) if lr_schedule is not None else None,
         solution_label="best" if population_based else "mean",
     )
@@ -835,13 +915,13 @@ def run_soo_es(
         sol_details.update(_maybe_ce_train_details(problem, sol_x))
         if algo == "jde":
             sol_details.update(_jde_control_means(state))
+        if algo in ADAPTIVE_SIGMA_ALGOS:
+            sol_details.update(_ada_sigma_stats(state))
         sol_f = float(sol_details["f"])
         mean_f_history[gen] = sol_f
 
         pop_best_f = float(np.min(fitness))
-        cur_sigma = (
-            sigma_at(sigma_schedule, gen - 1) if sigma_schedule is not None else None
-        )
+        cur_sigma = _current_sigma_scalar(algo, state, sigma_schedule, gen - 1)
         cur_lr = sigma_at(lr_schedule, gen - 1) if lr_schedule is not None else None
         _log_soo_step(
             step=gen,
@@ -1008,6 +1088,9 @@ def build_soo_wandb_config(
     es_optim_wd = getattr(args, "es_optim_wd", DEFAULT_ES_OPTIM_WD)
     es_sigma_scheduler = getattr(args, "es_sigma_scheduler", DEFAULT_ES_SIGMA_SCHEDULER)
     es_sigma_end = getattr(args, "es_sigma_end", None)
+    es_sigma_lr = getattr(args, "es_sigma_lr", None)
+    es_sigma_min = getattr(args, "es_sigma_min", None)
+    es_sigma_max = getattr(args, "es_sigma_max", None)
     asebo_subspace_dims = getattr(
         args, "asebo_subspace_dims", DEFAULT_ASEBO_SUBSPACE_DIMS
     )
@@ -1056,6 +1139,9 @@ def build_soo_wandb_config(
         "es_optim_wd": es_optim_wd,
         "es_sigma_scheduler": es_sigma_scheduler,
         "es_sigma_end": es_sigma_end,
+        "es_sigma_lr": es_sigma_lr,
+        "es_sigma_min": es_sigma_min,
+        "es_sigma_max": es_sigma_max,
         "asebo_subspace_dims": asebo_subspace_dims,
         "sparse_es_mask_prob": sparse_es_mask_prob,
         "de_f": de_f,
@@ -1099,6 +1185,9 @@ def build_soo_wandb_config(
             "es_optim_wd": es_optim_wd,
             "es_sigma_scheduler": es_sigma_scheduler,
             "es_sigma_end": es_sigma_end,
+            "es_sigma_lr": es_sigma_lr,
+            "es_sigma_min": es_sigma_min,
+            "es_sigma_max": es_sigma_max,
             "asebo_subspace_dims": asebo_subspace_dims,
             "sparse_es_mask_prob": sparse_es_mask_prob,
             "de_f": de_f,

@@ -6,6 +6,7 @@ SOO_ALGORITHMS = (
     "xnes",
     "open_es",
     "sparse_open_es",
+    "ada_open_es",
     "cr_fm_nes",
     "asebo",
     "lm_ma_es",
