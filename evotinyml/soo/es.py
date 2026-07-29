@@ -45,6 +45,8 @@ EVOSAX_SOO_ALGOS = {
     "de": ("DifferentialEvolution", "DE"),
     "jde": ("JDE", "jDE"),
     "pso": ("PSO", "PSO"),
+    "fa_pso": ("FilteredPSO", "FA-PSO"),
+    "ua_pso": ("UncertaintyAwarePSO", "UA-PSO"),
 }
 
 # Algos that require an even population size (antithetic / paired sampling).
@@ -56,11 +58,17 @@ MEAN_OPTIMIZER_ALGOS = frozenset(
     {"open_es", "sparse_open_es", "ada_open_es", "snes", "xnes", "asebo"}
 )
 # Sampling-noise σ schedule (--es-sigma*).
-SIGMA_SCHEDULE_ALGOS = frozenset({"open_es", "sparse_open_es", "asebo"})
+SIGMA_SCHEDULE_ALGOS = frozenset(
+    {"open_es", "sparse_open_es", "asebo", "fa_pso", "ua_pso"}
+)
 # Self-adapted per-parameter σ (no schedule; --es-sigma-lr/-min/-max instead).
 ADAPTIVE_SIGMA_ALGOS = frozenset({"ada_open_es"})
 # Population-based (init with evaluated population; report best member).
-POPULATION_BASED_ALGOS = frozenset({"de", "jde", "pso"})
+POPULATION_BASED_ALGOS = frozenset({"de", "jde", "pso", "fa_pso", "ua_pso"})
+# Population-based algos that report a filtered attractor / evidence-ranked
+# archive member instead of a greedy archive best (soo.pso_filtered,
+# soo.pso_uncertainty).
+ATTRACTOR_REPORTING_ALGOS = frozenset({"fa_pso", "ua_pso"})
 
 # Momentum (--es-optim-momentum) applies to sgd and rmsprop only.
 ES_OPTIMS = ("sgd", "adam", "adamw", "rmsprop")
@@ -107,6 +115,26 @@ DEFAULT_PSO_COGNITIVE = 1.5
 DEFAULT_PSO_SOCIAL = 2.0
 # Clamp each velocity component to [-v_max, v_max].
 DEFAULT_PSO_MAX_VELOCITY = 0.2
+# FA-PSO (soo.pso_filtered): attractor filtering rates and recombination width.
+# alpha: social attractor EMA; beta: personal attractor EMA; mu = ratio * popsize.
+DEFAULT_FA_PSO_SOCIAL_DECAY = 0.2
+DEFAULT_FA_PSO_PERSONAL_DECAY = 0.3
+DEFAULT_FA_PSO_ELITE_RATIO = 0.5
+# Adam variant: per-particle Adam on the attractor pull (drops inertia / v_max).
+DEFAULT_FA_PSO_ADAM = False
+DEFAULT_FA_PSO_LR = 0.01
+# UA-PSO (soo.pso_uncertainty). popsize counts 2*particles + archive evals per
+# generation, so at matched FEs UA-PSO runs a smaller swarm than FA-PSO.
+DEFAULT_UA_PSO_ARCHIVE = 5
+DEFAULT_UA_PSO_PROTECT = 3
+DEFAULT_UA_PSO_DELTA = 0.0
+DEFAULT_UA_PSO_SIGMA_SCALE = 1.0
+DEFAULT_UA_PSO_W_MIN = 0.05
+DEFAULT_UA_PSO_Q_PROMOTE = 0.4
+DEFAULT_UA_PSO_SCORE_DECAY = 0.3
+DEFAULT_UA_PSO_LEADER_TEMP = 1.0
+# Ablation switch: False pins w to w_min and bypasses the confidence gate.
+DEFAULT_UA_PSO_GATE = True
 
 
 def default_es_popsize(n_var: int) -> int:
@@ -202,9 +230,69 @@ def _state_best(state, xl: float, xu: float) -> np.ndarray:
 
 def _state_solution(algo: str, state, xl: float, xu: float) -> np.ndarray:
     """Solution used for logging / validation / saving."""
+    if algo == "ua_pso":
+        # Best archive member by evidence-shrunk score, not by raw fitness.
+        n = np.asarray(state.archive_count, dtype=np.float64)
+        eff = np.asarray(state.archive_mean, dtype=np.float64) * (n / (n + 3.0))
+        best = np.asarray(state.archive, dtype=np.float64)[int(np.argmin(eff))]
+        return np.clip(best, xl, xu)
+    if algo in ATTRACTOR_REPORTING_ALGOS:
+        # FA-PSO keeps no honest archive: state.best_solution is the greedy
+        # cross-generation ratchet maintained by evosax's base tell, which is
+        # exactly the bias the algorithm removes. Report the filtered attractor.
+        return np.clip(np.asarray(state.social, dtype=np.float64), xl, xu)
     if algo in POPULATION_BASED_ALGOS:
         return _state_best(state, xl, xu)
     return _state_mean(state, xl, xu)
+
+
+def _fa_pso_stats(state) -> dict[str, float]:
+    """Swarm-collapse diagnostics for FA-PSO.
+
+    ``fa_diversity`` shrinking toward 0 is the stagnation signature; watch it
+    against ``fa_step_norm`` to tell convergence from a frozen swarm.
+    """
+    population = np.asarray(state.population, dtype=np.float64)
+    personal = np.asarray(state.personal, dtype=np.float64)
+    velocity = np.asarray(state.velocity, dtype=np.float64)
+    centroid = population.mean(axis=0)
+    return {
+        "fa_std": float(state.std),
+        "fa_diversity": float(np.linalg.norm(population - centroid, axis=1).mean()),
+        "fa_step_norm": float(np.linalg.norm(velocity, axis=1).mean()),
+        "fa_personal_spread": float(
+            np.linalg.norm(personal - population, axis=1).mean()
+        ),
+        "fa_social_gap": float(np.linalg.norm(state.social - centroid)),
+    }
+
+
+def _ua_pso_stats(state) -> dict[str, float]:
+    """Confidence diagnostics for UA-PSO.
+
+    ``ua_w_p`` / ``ua_w_g`` decaying to ``w_min`` together with ``ua_uncertain``
+    rising toward 1 is the freeze signature: the algorithm has stopped because it
+    can no longer prove any attractor is better, which is the cue to grow the
+    batch rather than to tune the coefficients.
+    """
+    particles = np.asarray(state.particles, dtype=np.float64)
+    centroid = particles.mean(axis=0)
+    return {
+        "ua_sigma_noise": float(state.diag_sigma),
+        "ua_q_p": float(state.diag_q_p),
+        "ua_q_g": float(state.diag_q_g),
+        "ua_w_p": float(state.diag_w_p),
+        "ua_w_g": float(state.diag_w_g),
+        "ua_uncertain": float(state.diag_uncertain),
+        "ua_std": float(state.std),
+        "ua_diversity": float(
+            np.linalg.norm(particles - centroid, axis=1).mean()
+        ),
+        "ua_step_norm": float(
+            np.linalg.norm(np.asarray(state.velocity), axis=1).mean()
+        ),
+        "ua_archive_age": float(np.mean(np.asarray(state.archive_count))),
+    }
 
 
 def _jde_control_means(state) -> dict[str, float]:
@@ -484,6 +572,20 @@ def _build_evosax(
     pso_cognitive: float = DEFAULT_PSO_COGNITIVE,
     pso_social: float = DEFAULT_PSO_SOCIAL,
     pso_max_velocity: float = DEFAULT_PSO_MAX_VELOCITY,
+    fa_pso_social_decay: float = DEFAULT_FA_PSO_SOCIAL_DECAY,
+    fa_pso_personal_decay: float = DEFAULT_FA_PSO_PERSONAL_DECAY,
+    fa_pso_elite_ratio: float = DEFAULT_FA_PSO_ELITE_RATIO,
+    fa_pso_adam: bool = DEFAULT_FA_PSO_ADAM,
+    fa_pso_lr: float = DEFAULT_FA_PSO_LR,
+    ua_pso_archive: int = DEFAULT_UA_PSO_ARCHIVE,
+    ua_pso_protect: int = DEFAULT_UA_PSO_PROTECT,
+    ua_pso_delta: float = DEFAULT_UA_PSO_DELTA,
+    ua_pso_sigma_scale: float = DEFAULT_UA_PSO_SIGMA_SCALE,
+    ua_pso_w_min: float = DEFAULT_UA_PSO_W_MIN,
+    ua_pso_q_promote: float = DEFAULT_UA_PSO_Q_PROMOTE,
+    ua_pso_score_decay: float = DEFAULT_UA_PSO_SCORE_DECAY,
+    ua_pso_leader_temp: float = DEFAULT_UA_PSO_LEADER_TEMP,
+    ua_pso_gate: bool = DEFAULT_UA_PSO_GATE,
 ):
     """Construct an evosax ES and params; may bump popsize for even-pop algos."""
     from evosax import algorithms as evosax_algorithms
@@ -497,7 +599,9 @@ def _build_evosax(
         SparseOpenES,
         xNES,
     )
+    from evotinyml.soo.pso_filtered import FilteredPSO
     from evotinyml.soo.pso_fixed import FixedPSO
+    from evotinyml.soo.pso_uncertainty import UncertaintyAwarePSO
 
     if algo not in EVOSAX_SOO_ALGOS:
         raise ValueError(
@@ -521,6 +625,10 @@ def _build_evosax(
         Cls = JDE
     elif algo == "pso":
         Cls = FixedPSO
+    elif algo == "fa_pso":
+        Cls = FilteredPSO
+    elif algo == "ua_pso":
+        Cls = UncertaintyAwarePSO
     else:
         Cls = getattr(evosax_algorithms, cls_name)
     sigma = float(init_sigma)
@@ -534,8 +642,8 @@ def _build_evosax(
         population_size += 1
     if algo in {"de", "jde"} and population_size < 4:
         raise ValueError(f"{display_name} requires popsize >= 4, got {population_size}")
-    if algo == "pso" and population_size < 2:
-        raise ValueError(f"PSO requires popsize >= 2, got {population_size}")
+    if algo in {"pso", "fa_pso"} and population_size < 2:
+        raise ValueError(f"{display_name} requires popsize >= 2, got {population_size}")
 
     kwargs: dict[str, Any] = {
         "population_size": population_size,
@@ -570,6 +678,15 @@ def _build_evosax(
         kwargs["subspace_dims"] = dims
     if algo == "sparse_open_es":
         kwargs["mask_prob"] = float(sparse_es_mask_prob)
+    if algo == "fa_pso":
+        ratio = float(fa_pso_elite_ratio)
+        if not 0.0 < ratio <= 1.0:
+            raise ValueError(f"fa_pso_elite_ratio must be in (0, 1], got {ratio}")
+        kwargs["elite_ratio"] = ratio
+        kwargs["use_adam"] = bool(fa_pso_adam)
+    if algo == "ua_pso":
+        kwargs["archive_size"] = int(ua_pso_archive)
+        kwargs["protect_generations"] = int(ua_pso_protect)
 
     es = Cls(**kwargs)
     params = es.default_params
@@ -627,6 +744,53 @@ def _build_evosax(
             cognitive_coeff=float(pso_cognitive),
             social_coeff=float(pso_social),
             v_max=v_max,
+        )
+    if algo == "fa_pso":
+        v_max = float(pso_max_velocity)
+        if v_max <= 0.0:
+            raise ValueError(f"pso_max_velocity must be > 0, got {v_max}")
+        alpha = float(fa_pso_social_decay)
+        beta = float(fa_pso_personal_decay)
+        if not 0.0 < alpha <= 1.0:
+            raise ValueError(f"fa_pso_social_decay must be in (0, 1], got {alpha}")
+        if not 0.0 < beta <= 1.0:
+            raise ValueError(f"fa_pso_personal_decay must be in (0, 1], got {beta}")
+        lr = float(fa_pso_lr)
+        if fa_pso_adam and lr <= 0.0:
+            raise ValueError(f"fa_pso_lr must be > 0, got {lr}")
+        params = params.replace(
+            inertia_coeff=float(pso_inertia),
+            cognitive_coeff=float(pso_cognitive),
+            social_coeff=float(pso_social),
+            v_max=v_max,
+            social_decay=alpha,
+            personal_decay=beta,
+            lr=lr,
+        )
+    if algo == "ua_pso":
+        v_max = float(pso_max_velocity)
+        if v_max <= 0.0:
+            raise ValueError(f"pso_max_velocity must be > 0, got {v_max}")
+        w_min = float(ua_pso_w_min)
+        q_promote = float(ua_pso_q_promote)
+        if not 0.0 <= w_min <= 1.0:
+            raise ValueError(f"ua_pso_w_min must be in [0, 1], got {w_min}")
+        if not 0.0 < q_promote < 0.5:
+            raise ValueError(
+                f"ua_pso_q_promote must be in (0, 0.5), got {q_promote}"
+            )
+        params = params.replace(
+            inertia_coeff=float(pso_inertia),
+            cognitive_coeff=float(pso_cognitive),
+            social_coeff=float(pso_social),
+            v_max=v_max,
+            delta=float(ua_pso_delta),
+            sigma_scale=float(ua_pso_sigma_scale),
+            w_min=w_min,
+            q_promote=q_promote,
+            score_decay=float(ua_pso_score_decay),
+            leader_temp=float(ua_pso_leader_temp),
+            gate_weights=bool(ua_pso_gate),
         )
 
     return es, params, population_size, display_name
@@ -692,6 +856,20 @@ def run_soo_es(
     pso_cognitive: float = DEFAULT_PSO_COGNITIVE,
     pso_social: float = DEFAULT_PSO_SOCIAL,
     pso_max_velocity: float = DEFAULT_PSO_MAX_VELOCITY,
+    fa_pso_social_decay: float = DEFAULT_FA_PSO_SOCIAL_DECAY,
+    fa_pso_personal_decay: float = DEFAULT_FA_PSO_PERSONAL_DECAY,
+    fa_pso_elite_ratio: float = DEFAULT_FA_PSO_ELITE_RATIO,
+    fa_pso_adam: bool = DEFAULT_FA_PSO_ADAM,
+    fa_pso_lr: float = DEFAULT_FA_PSO_LR,
+    ua_pso_archive: int = DEFAULT_UA_PSO_ARCHIVE,
+    ua_pso_protect: int = DEFAULT_UA_PSO_PROTECT,
+    ua_pso_delta: float = DEFAULT_UA_PSO_DELTA,
+    ua_pso_sigma_scale: float = DEFAULT_UA_PSO_SIGMA_SCALE,
+    ua_pso_w_min: float = DEFAULT_UA_PSO_W_MIN,
+    ua_pso_q_promote: float = DEFAULT_UA_PSO_Q_PROMOTE,
+    ua_pso_score_decay: float = DEFAULT_UA_PSO_SCORE_DECAY,
+    ua_pso_leader_temp: float = DEFAULT_UA_PSO_LEADER_TEMP,
+    ua_pso_gate: bool = DEFAULT_UA_PSO_GATE,
 ) -> SOOESResult:
     """Ask / eval / tell loop for evosax SOO algorithms.
 
@@ -713,6 +891,12 @@ def run_soo_es(
         )
     fitness_name = soo.fitness_name
     population_based = algo in POPULATION_BASED_ALGOS
+    if algo in ATTRACTOR_REPORTING_ALGOS:
+        solution_label = "attractor"
+    elif population_based:
+        solution_label = "best"
+    else:
+        solution_label = "mean"
 
     n_var = int(problem.n_var)
     if popsize is None:
@@ -781,6 +965,20 @@ def run_soo_es(
         pso_cognitive=pso_cognitive,
         pso_social=pso_social,
         pso_max_velocity=pso_max_velocity,
+        fa_pso_social_decay=fa_pso_social_decay,
+        fa_pso_personal_decay=fa_pso_personal_decay,
+        fa_pso_elite_ratio=fa_pso_elite_ratio,
+        fa_pso_adam=fa_pso_adam,
+        fa_pso_lr=fa_pso_lr,
+        ua_pso_archive=ua_pso_archive,
+        ua_pso_protect=ua_pso_protect,
+        ua_pso_delta=ua_pso_delta,
+        ua_pso_sigma_scale=ua_pso_sigma_scale,
+        ua_pso_w_min=ua_pso_w_min,
+        ua_pso_q_promote=ua_pso_q_promote,
+        ua_pso_score_decay=ua_pso_score_decay,
+        ua_pso_leader_temp=ua_pso_leader_temp,
+        ua_pso_gate=ua_pso_gate,
     )
     sigma_schedule = (
         build_es_sigma_schedule(
@@ -837,13 +1035,18 @@ def run_soo_es(
         # evosax PR #109: seed archive when stock init left it unset (DE).
         state = _seed_archive_from_init(state, pop0, fit0)
         sol_x = _state_solution(algo, state, xl, xu)
-        # Prefer the evaluated init fitness for the reported best member.
-        best_idx = int(np.argmin(fit0))
-        sol_x = np.clip(pop0[best_idx], xl, xu)
+        if algo not in ATTRACTOR_REPORTING_ALGOS:
+            # Prefer the evaluated init fitness for the reported best member.
+            best_idx = int(np.argmin(fit0))
+            sol_x = np.clip(pop0[best_idx], xl, xu)
         sol_details = soo.evaluate_one(sol_x)
         sol_details.update(_maybe_ce_train_details(problem, sol_x))
         if algo == "jde":
             sol_details.update(_jde_control_means(state))
+        if algo == "fa_pso":
+            sol_details.update(_fa_pso_stats(state))
+        if algo == "ua_pso":
+            sol_details.update(_ua_pso_stats(state))
         sol_f = float(sol_details["f"])
         init_pop_best = float(np.min(fit0))
     else:
@@ -877,7 +1080,7 @@ def run_soo_es(
         pop_best_f=init_pop_best,
         es_sigma=_current_sigma_scalar(algo, state, sigma_schedule, 0),
         es_lr=sigma_at(lr_schedule, 0) if lr_schedule is not None else None,
-        solution_label="best" if population_based else "mean",
+        solution_label=solution_label,
     )
     if test_loader is not None and val_every > 0:
         _maybe_validate_mean(
@@ -890,7 +1093,7 @@ def run_soo_es(
             use_wandb=use_wandb,
             verbose=verbose,
             force=True,
-            solution_label="best" if population_based else "mean",
+            solution_label=solution_label,
         )
 
     for gen in range(1, ask_steps + 1):
@@ -915,6 +1118,10 @@ def run_soo_es(
         sol_details.update(_maybe_ce_train_details(problem, sol_x))
         if algo == "jde":
             sol_details.update(_jde_control_means(state))
+        if algo == "fa_pso":
+            sol_details.update(_fa_pso_stats(state))
+        if algo == "ua_pso":
+            sol_details.update(_ua_pso_stats(state))
         if algo in ADAPTIVE_SIGMA_ALGOS:
             sol_details.update(_ada_sigma_stats(state))
         sol_f = float(sol_details["f"])
@@ -935,7 +1142,7 @@ def run_soo_es(
             pop_best_f=pop_best_f,
             es_sigma=cur_sigma,
             es_lr=cur_lr,
-            solution_label="best" if population_based else "mean",
+            solution_label=solution_label,
         )
 
         if test_loader is not None and val_every > 0:
@@ -949,7 +1156,7 @@ def run_soo_es(
                 use_wandb=use_wandb,
                 verbose=verbose,
                 force=(gen == 1) or (gen % val_every == 0) or (gen == ask_steps),
-                solution_label="best" if population_based else "mean",
+                solution_label=solution_label,
             )
 
     return SOOESResult(
@@ -1061,7 +1268,9 @@ def _maybe_validate_mean(
         )
         metrics.update(class_metric_log_dict("val", acc_c, ce_c))
     if verbose:
-        tag = "pop best" if solution_label == "best" else "ES mean"
+        tag = {"best": "pop best", "attractor": "attractor"}.get(
+            solution_label, "ES mean"
+        )
         print(
             f"[val n_eval={n_eval} step={opt_step}] ({tag}) "
             f"acc={acc:.4f}  f1={f1:.4f}  P={prec:.4f}  R={rec:.4f}"
@@ -1111,8 +1320,22 @@ def build_soo_wandb_config(
     pso_cognitive = getattr(args, "pso_cognitive", DEFAULT_PSO_COGNITIVE)
     pso_social = getattr(args, "pso_social", DEFAULT_PSO_SOCIAL)
     pso_max_velocity = getattr(args, "pso_max_velocity", DEFAULT_PSO_MAX_VELOCITY)
-    val_solution = "de_best" if algo in POPULATION_BASED_ALGOS else "es_mean"
-    if algo in {"jde", "pso"}:
+    fa_pso_social_decay = getattr(
+        args, "fa_pso_social_decay", DEFAULT_FA_PSO_SOCIAL_DECAY
+    )
+    fa_pso_personal_decay = getattr(
+        args, "fa_pso_personal_decay", DEFAULT_FA_PSO_PERSONAL_DECAY
+    )
+    fa_pso_elite_ratio = getattr(args, "fa_pso_elite_ratio", DEFAULT_FA_PSO_ELITE_RATIO)
+    fa_pso_adam = getattr(args, "fa_pso_adam", DEFAULT_FA_PSO_ADAM)
+    fa_pso_lr = getattr(args, "fa_pso_lr", DEFAULT_FA_PSO_LR)
+    if algo in ATTRACTOR_REPORTING_ALGOS:
+        val_solution = "fa_attractor"
+    elif algo in POPULATION_BASED_ALGOS:
+        val_solution = "de_best"
+    else:
+        val_solution = "es_mean"
+    if algo in {"jde", "pso", "fa_pso"}:
         library = f"evosax+{algo}"
     else:
         library = "evosax"
@@ -1158,6 +1381,11 @@ def build_soo_wandb_config(
         "pso_cognitive": pso_cognitive,
         "pso_social": pso_social,
         "pso_max_velocity": pso_max_velocity,
+        "fa_pso_social_decay": fa_pso_social_decay,
+        "fa_pso_personal_decay": fa_pso_personal_decay,
+        "fa_pso_elite_ratio": fa_pso_elite_ratio,
+        "fa_pso_adam": fa_pso_adam,
+        "fa_pso_lr": fa_pso_lr,
         "steps": args.steps,
         "evals": getattr(args, "evals", None),
         "popsize": popsize,

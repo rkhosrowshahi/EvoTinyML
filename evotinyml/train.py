@@ -53,6 +53,11 @@ from evotinyml.soo.es import (
     DEFAULT_ES_SIGMA_MAX_RATIO,
     DEFAULT_ES_SIGMA_MIN_RATIO,
     DEFAULT_ES_SIGMA_SCHEDULER,
+    DEFAULT_FA_PSO_ADAM,
+    DEFAULT_FA_PSO_ELITE_RATIO,
+    DEFAULT_FA_PSO_LR,
+    DEFAULT_FA_PSO_PERSONAL_DECAY,
+    DEFAULT_FA_PSO_SOCIAL_DECAY,
     DEFAULT_JDE_CR_INIT,
     DEFAULT_JDE_ELITISM,
     DEFAULT_JDE_F_INIT,
@@ -65,12 +70,22 @@ from evotinyml.soo.es import (
     DEFAULT_PSO_MAX_VELOCITY,
     DEFAULT_PSO_SOCIAL,
     DEFAULT_SPARSE_ES_MASK_PROB,
+    DEFAULT_UA_PSO_ARCHIVE,
+    DEFAULT_UA_PSO_DELTA,
+    DEFAULT_UA_PSO_GATE,
+    DEFAULT_UA_PSO_LEADER_TEMP,
+    DEFAULT_UA_PSO_PROTECT,
+    DEFAULT_UA_PSO_Q_PROMOTE,
+    DEFAULT_UA_PSO_SCORE_DECAY,
+    DEFAULT_UA_PSO_SIGMA_SCALE,
+    DEFAULT_UA_PSO_W_MIN,
     ADAPTIVE_SIGMA_ALGOS,
     ES_OPTIMS,
     ES_OPTIM_SCHEDULERS,
     ES_SIGMA_SCHEDULERS,
     EVOSAX_SOO_ALGOS,
     MEAN_OPTIMIZER_ALGOS,
+    ATTRACTOR_REPORTING_ALGOS,
     POPULATION_BASED_ALGOS,
     SIGMA_SCHEDULE_ALGOS,
     build_soo_wandb_config,
@@ -556,6 +571,144 @@ def parse_args() -> argparse.Namespace:
         help=(
             "PSO velocity clamp v_max: clip each velocity component to "
             f"[-v_max, v_max]. Default: {DEFAULT_PSO_MAX_VELOCITY}."
+        ),
+    )
+    parser.add_argument(
+        "--fa-pso-social-decay",
+        type=float,
+        default=DEFAULT_FA_PSO_SOCIAL_DECAY,
+        help=(
+            "FA-PSO social attractor EMA rate alpha in (0, 1]: "
+            "g <- (1-alpha)*g + alpha*rank_weighted_centroid. 1.0 disables "
+            f"temporal filtering. Default: {DEFAULT_FA_PSO_SOCIAL_DECAY}."
+        ),
+    )
+    parser.add_argument(
+        "--fa-pso-personal-decay",
+        type=float,
+        default=DEFAULT_FA_PSO_PERSONAL_DECAY,
+        help=(
+            "FA-PSO personal attractor EMA rate beta in (0, 1]: "
+            "p_i <- (1-beta)*p_i + beta*x_i for the better half of the swarm. "
+            "1.0 recovers rank-gated hard replacement. Default: "
+            f"{DEFAULT_FA_PSO_PERSONAL_DECAY}."
+        ),
+    )
+    parser.add_argument(
+        "--fa-pso-elite-ratio",
+        type=float,
+        default=DEFAULT_FA_PSO_ELITE_RATIO,
+        help=(
+            "FA-PSO recombination width mu / popsize in (0, 1]. Lower is "
+            "greedier (mu=1 recovers an argmin gbest). Default: "
+            f"{DEFAULT_FA_PSO_ELITE_RATIO}."
+        ),
+    )
+    parser.add_argument(
+        "--fa-pso-adam",
+        action="store_true",
+        default=DEFAULT_FA_PSO_ADAM,
+        help=(
+            "FA-PSO: apply per-particle Adam to the attractor pull instead of "
+            "the velocity update. Supersedes --pso-inertia and "
+            "--pso-max-velocity. KNOWN BROKEN (the swarm diverges: Adam "
+            "normalizes away the restoring force); ablation use only."
+        ),
+    )
+    parser.add_argument(
+        "--fa-pso-lr",
+        type=float,
+        default=DEFAULT_FA_PSO_LR,
+        help=(
+            "FA-PSO Adam learning rate eta (used with --fa-pso-adam). "
+            f"Default: {DEFAULT_FA_PSO_LR}."
+        ),
+    )
+    parser.add_argument(
+        "--ua-pso-archive",
+        type=int,
+        default=DEFAULT_UA_PSO_ARCHIVE,
+        help=(
+            "UA-PSO social archive size K (statistically supported candidates "
+            f"kept instead of one gbest). Default: {DEFAULT_UA_PSO_ARCHIVE}. "
+            "NOTE: --popsize counts 2*particles + K evaluations per generation."
+        ),
+    )
+    parser.add_argument(
+        "--ua-pso-protect",
+        type=int,
+        default=DEFAULT_UA_PSO_PROTECT,
+        help=(
+            "UA-PSO generations a new archive member is protected from eviction "
+            f"so it can accumulate evidence. Default: {DEFAULT_UA_PSO_PROTECT}."
+        ),
+    )
+    parser.add_argument(
+        "--ua-pso-delta",
+        type=float,
+        default=DEFAULT_UA_PSO_DELTA,
+        help=(
+            "UA-PSO practical-significance margin delta in "
+            "q = P(F(p) + delta < F(x)). Default: "
+            f"{DEFAULT_UA_PSO_DELTA}."
+        ),
+    )
+    parser.add_argument(
+        "--ua-pso-sigma-scale",
+        type=float,
+        default=DEFAULT_UA_PSO_SIGMA_SCALE,
+        help=(
+            "UA-PSO multiplier on the pooled noise estimate. >1 is more "
+            "conservative (weaker pulls, more 'uncertain'); <1 more decisive. "
+            f"Default: {DEFAULT_UA_PSO_SIGMA_SCALE}."
+        ),
+    )
+    parser.add_argument(
+        "--ua-pso-w-min",
+        type=float,
+        default=DEFAULT_UA_PSO_W_MIN,
+        help=(
+            "UA-PSO floor on the attraction weight w(q) = max(w_min, 2q-1). "
+            "0 is the pure design and can freeze the swarm once evidence runs "
+            f"out. Default: {DEFAULT_UA_PSO_W_MIN}."
+        ),
+    )
+    parser.add_argument(
+        "--ua-pso-q-promote",
+        type=float,
+        default=DEFAULT_UA_PSO_Q_PROMOTE,
+        help=(
+            "UA-PSO: promote x_i over its personal incumbent when q^p falls "
+            f"below this. Default: {DEFAULT_UA_PSO_Q_PROMOTE}."
+        ),
+    )
+    parser.add_argument(
+        "--ua-pso-score-decay",
+        type=float,
+        default=DEFAULT_UA_PSO_SCORE_DECAY,
+        help=(
+            "UA-PSO EMA rate for accumulated archive scores. Default: "
+            f"{DEFAULT_UA_PSO_SCORE_DECAY}."
+        ),
+    )
+    parser.add_argument(
+        "--ua-pso-leader-temp",
+        type=float,
+        default=DEFAULT_UA_PSO_LEADER_TEMP,
+        help=(
+            "UA-PSO softmax temperature for probability-weighted leader "
+            f"sampling; ->0 is greedy. Default: {DEFAULT_UA_PSO_LEADER_TEMP}."
+        ),
+    )
+    parser.add_argument(
+        "--ua-pso-no-gate",
+        dest="ua_pso_gate",
+        action="store_false",
+        default=DEFAULT_UA_PSO_GATE,
+        help=(
+            "UA-PSO ablation: pin the attraction weights to --ua-pso-w-min and "
+            "bypass the confidence gate, while leaving q in charge of archive "
+            "promotion. Isolates the gate's contribution."
         ),
     )
     parser.add_argument(
@@ -1193,10 +1346,32 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
         or float(args.pso_social) != DEFAULT_PSO_SOCIAL
         or float(args.pso_max_velocity) != DEFAULT_PSO_MAX_VELOCITY
     )
-    if algo != "pso" and pso_opts_nondefault:
+    if algo not in {"pso", "fa_pso", "ua_pso"} and pso_opts_nondefault:
         print(
-            f"Note: --pso-* flags are ignored for --algo {algo} (pso only)."
+            f"Note: --pso-* flags are ignored for --algo {algo} "
+            "(pso / fa_pso only)."
         )
+    fa_pso_opts_nondefault = (
+        float(args.fa_pso_social_decay) != DEFAULT_FA_PSO_SOCIAL_DECAY
+        or float(args.fa_pso_personal_decay) != DEFAULT_FA_PSO_PERSONAL_DECAY
+        or float(args.fa_pso_elite_ratio) != DEFAULT_FA_PSO_ELITE_RATIO
+        or bool(args.fa_pso_adam) != DEFAULT_FA_PSO_ADAM
+        or float(args.fa_pso_lr) != DEFAULT_FA_PSO_LR
+    )
+    if algo != "fa_pso" and fa_pso_opts_nondefault:
+        print(
+            f"Note: --fa-pso-* flags are ignored for --algo {algo} (fa_pso only)."
+        )
+    if algo == "fa_pso" and args.fa_pso_adam:
+        # beta_1 is the momentum and Adam's per-coordinate scaling bounds the
+        # step, so stacking inertia / v_max on top is double filtering.
+        if float(args.pso_inertia) != DEFAULT_PSO_INERTIA or float(
+            args.pso_max_velocity
+        ) != DEFAULT_PSO_MAX_VELOCITY:
+            print(
+                "Note: --fa-pso-adam supersedes --pso-inertia and "
+                "--pso-max-velocity; both are ignored."
+            )
 
     popsize = _resolve_popsize(args, problem.n_var)
     steps, evals = _resolve_steps_and_evals(args, popsize)
@@ -1281,15 +1456,36 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
             f"jde_tau_f={args.jde_tau_f}  jde_tau_cr={args.jde_tau_cr}  "
             f"jde_elitism={args.jde_elitism}"
         )
-    if algo == "pso":
+    if algo in {"pso", "fa_pso", "ua_pso"}:
         es_banner += (
             f"  pso_inertia={args.pso_inertia}  "
             f"pso_cognitive={args.pso_cognitive}  "
             f"pso_social={args.pso_social}  "
             f"pso_max_velocity={args.pso_max_velocity}"
         )
+    if algo == "fa_pso":
+        es_banner += (
+            f"  fa_pso_social_decay={args.fa_pso_social_decay}  "
+            f"fa_pso_personal_decay={args.fa_pso_personal_decay}  "
+            f"fa_pso_elite_ratio={args.fa_pso_elite_ratio}  "
+            f"fa_pso_adam={args.fa_pso_adam}"
+        )
+        if args.fa_pso_adam:
+            es_banner += f"  fa_pso_lr={args.fa_pso_lr}"
+    if algo == "ua_pso":
+        es_banner += (
+            f"  ua_pso_archive={args.ua_pso_archive}  "
+            f"ua_pso_w_min={args.ua_pso_w_min}  "
+            f"ua_pso_q_promote={args.ua_pso_q_promote}  "
+            f"ua_pso_sigma_scale={args.ua_pso_sigma_scale}"
+        )
 
-    sol_tag = "best" if algo in POPULATION_BASED_ALGOS else "mean"
+    if algo in ATTRACTOR_REPORTING_ALGOS:
+        sol_tag = "attractor"
+    elif algo in POPULATION_BASED_ALGOS:
+        sol_tag = "best"
+    else:
+        sol_tag = "mean"
     w_str = ",".join(f"{x:g}" for x in args.scalar_weights_resolved)
     print(
         f"dataset={args.dataset}  model={args.model}  problem={args.problem}  "
@@ -1349,6 +1545,20 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
             pso_cognitive=args.pso_cognitive,
             pso_social=args.pso_social,
             pso_max_velocity=args.pso_max_velocity,
+            fa_pso_social_decay=args.fa_pso_social_decay,
+            fa_pso_personal_decay=args.fa_pso_personal_decay,
+            fa_pso_elite_ratio=args.fa_pso_elite_ratio,
+            fa_pso_adam=args.fa_pso_adam,
+            fa_pso_lr=args.fa_pso_lr,
+            ua_pso_archive=args.ua_pso_archive,
+            ua_pso_protect=args.ua_pso_protect,
+            ua_pso_delta=args.ua_pso_delta,
+            ua_pso_sigma_scale=args.ua_pso_sigma_scale,
+            ua_pso_w_min=args.ua_pso_w_min,
+            ua_pso_q_promote=args.ua_pso_q_promote,
+            ua_pso_score_decay=args.ua_pso_score_decay,
+            ua_pso_leader_temp=args.ua_pso_leader_temp,
+            ua_pso_gate=args.ua_pso_gate,
         )
     except Exception:
         finish_wandb()
@@ -1370,7 +1580,11 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
         "final/fitness": result.fitness_name,
         "final/algo": algo,
         "final/val_solution": (
-            "de_best" if algo in POPULATION_BASED_ALGOS else "es_mean"
+            "fa_attractor"
+            if algo in ATTRACTOR_REPORTING_ALGOS
+            else "de_best"
+            if algo in POPULATION_BASED_ALGOS
+            else "es_mean"
         ),
         **{f"final/{k}": v for k, v in result.details.items() if k != "f"},
     }
