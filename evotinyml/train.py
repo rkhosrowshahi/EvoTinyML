@@ -64,6 +64,20 @@ from evotinyml.soo.es import (
     DEFAULT_PSO_INERTIA,
     DEFAULT_PSO_MAX_VELOCITY,
     DEFAULT_PSO_SOCIAL,
+    DEFAULT_PSO_EMA_ALPHA,
+    DEFAULT_PSO_KAPPA,
+    DEFAULT_PSO_LCB_BETA,
+    DEFAULT_PSO_GBEST_MODE,
+    DEFAULT_PSO_SOFT_ACCEPT,
+    DEFAULT_PSO_T0,
+    DEFAULT_PSO_T_GAMMA,
+    DEFAULT_PSO_TEST,
+    DEFAULT_PSO_REEVAL_MODE,
+    DEFAULT_PSO_GATE_BAND_KAPPA,
+    DEFAULT_PSO_REEVAL_PROB,
+    DEFAULT_PSO_DAMP_ETA0,
+    DEFAULT_PSO_DAMP_ETA_GAMMA,
+    DEFAULT_PSO_DAMP_ADAM,
     DEFAULT_SPARSE_ES_MASK_PROB,
     ADAPTIVE_SIGMA_ALGOS,
     ES_OPTIMS,
@@ -72,6 +86,7 @@ from evotinyml.soo.es import (
     EVOSAX_SOO_ALGOS,
     MEAN_OPTIMIZER_ALGOS,
     POPULATION_BASED_ALGOS,
+    PSO_ALGOS,
     SIGMA_SCHEDULE_ALGOS,
     build_soo_wandb_config,
     default_soo_popsize,
@@ -527,7 +542,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_PSO_INERTIA,
         help=(
-            f"PSO inertia coefficient w. Default: {DEFAULT_PSO_INERTIA}. "
+            f"PSO / RobustPSO inertia coefficient w. Default: {DEFAULT_PSO_INERTIA}. "
             "Ignored for non-PSO algos."
         ),
     )
@@ -536,7 +551,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_PSO_COGNITIVE,
         help=(
-            f"PSO cognitive coefficient c1 (pull to personal best). "
+            f"PSO / RobustPSO cognitive coefficient c1 (pull to personal best). "
             f"Default: {DEFAULT_PSO_COGNITIVE}."
         ),
     )
@@ -545,7 +560,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_PSO_SOCIAL,
         help=(
-            f"PSO social coefficient c2 (pull to global best). "
+            f"PSO / RobustPSO social coefficient c2 (pull to global best). "
             f"Default: {DEFAULT_PSO_SOCIAL}."
         ),
     )
@@ -554,8 +569,135 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_PSO_MAX_VELOCITY,
         help=(
-            "PSO velocity clamp v_max: clip each velocity component to "
-            f"[-v_max, v_max]. Default: {DEFAULT_PSO_MAX_VELOCITY}."
+            "PSO / RobustPSO velocity clamp v_max: clip each velocity "
+            f"component to [-v_max, v_max]. Default: {DEFAULT_PSO_MAX_VELOCITY}."
+        ),
+    )
+    parser.add_argument(
+        "--pso-ema-alpha",
+        type=float,
+        default=DEFAULT_PSO_EMA_ALPHA,
+        help=(
+            "EMA rate α for filtered incumbent fitness φ "
+            f"(pso_robust only). Default: {DEFAULT_PSO_EMA_ALPHA}."
+        ),
+    )
+    parser.add_argument(
+        "--pso-kappa",
+        type=float,
+        default=DEFAULT_PSO_KAPPA,
+        help=(
+            "Paired-test margin in SE units for confident replacement "
+            f"(pso_robust only). Default: {DEFAULT_PSO_KAPPA}."
+        ),
+    )
+    parser.add_argument(
+        "--pso-lcb-beta",
+        type=float,
+        default=DEFAULT_PSO_LCB_BETA,
+        help=(
+            "LCB pessimism β for uncertainty-aware gbest "
+            f"(pso_robust only). Default: {DEFAULT_PSO_LCB_BETA}."
+        ),
+    )
+    parser.add_argument(
+        "--pso-gbest-mode",
+        choices=("lcb", "thompson", "argmin"),
+        default=DEFAULT_PSO_GBEST_MODE,
+        help=(
+            "Social / archive attractor selection for pso_robust: "
+            f"lcb, thompson, or argmin. Default: {DEFAULT_PSO_GBEST_MODE}."
+        ),
+    )
+    parser.add_argument(
+        "--pso-soft-accept",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_PSO_SOFT_ACCEPT,
+        help=(
+            "Soft annealed acceptance σ(−z/T) instead of hard κ·SE test "
+            f"(pso_robust only). Default: {DEFAULT_PSO_SOFT_ACCEPT}."
+        ),
+    )
+    parser.add_argument(
+        "--pso-t0",
+        type=float,
+        default=DEFAULT_PSO_T0,
+        help=(
+            f"Initial soft-accept temperature T0 (pso_robust). "
+            f"Default: {DEFAULT_PSO_T0}."
+        ),
+    )
+    parser.add_argument(
+        "--pso-t-gamma",
+        type=float,
+        default=DEFAULT_PSO_T_GAMMA,
+        help=(
+            f"Soft-accept temperature decay γ (T←T0·γ^t, pso_robust). "
+            f"Default: {DEFAULT_PSO_T_GAMMA}."
+        ),
+    )
+    parser.add_argument(
+        "--pso-test",
+        choices=("ttest", "wilcoxon"),
+        default=DEFAULT_PSO_TEST,
+        help=(
+            "Paired confidence test for replacement: ttest or wilcoxon "
+            f"(pso_robust only). Default: {DEFAULT_PSO_TEST}."
+        ),
+    )
+    parser.add_argument(
+        "--pso-reeval-mode",
+        choices=("full", "g_only", "gated", "stochastic"),
+        default=DEFAULT_PSO_REEVAL_MODE,
+        help=(
+            "Incumbent re-eval budget for pso_robust: full (all pbests), "
+            f"g_only, gated near-misses, or stochastic. "
+            f"Default: {DEFAULT_PSO_REEVAL_MODE}."
+        ),
+    )
+    parser.add_argument(
+        "--pso-gate-band-kappa",
+        type=float,
+        default=DEFAULT_PSO_GATE_BAND_KAPPA,
+        help=(
+            "Gated re-eval band in candidate-SE units "
+            f"(pso_robust only). Default: {DEFAULT_PSO_GATE_BAND_KAPPA}."
+        ),
+    )
+    parser.add_argument(
+        "--pso-reeval-prob",
+        type=float,
+        default=DEFAULT_PSO_REEVAL_PROB,
+        help=(
+            "Per-particle re-eval probability for stochastic mode "
+            f"(pso_robust only). Default: {DEFAULT_PSO_REEVAL_PROB}."
+        ),
+    )
+    parser.add_argument(
+        "--pso-damp-eta0",
+        type=float,
+        default=DEFAULT_PSO_DAMP_ETA0,
+        help=(
+            "ES-flavored move step scale η0 on cognitive/social pull "
+            f"(pso_robust only). Default: {DEFAULT_PSO_DAMP_ETA0}."
+        ),
+    )
+    parser.add_argument(
+        "--pso-damp-eta-gamma",
+        type=float,
+        default=DEFAULT_PSO_DAMP_ETA_GAMMA,
+        help=(
+            "Move step decay γ (η←η0·γ^t, pso_robust). Default: "
+            f"{DEFAULT_PSO_DAMP_ETA_GAMMA} (no decay)."
+        ),
+    )
+    parser.add_argument(
+        "--pso-damp-adam",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_PSO_DAMP_ADAM,
+        help=(
+            "Adam-normalize velocity steps per dimension "
+            f"(pso_robust only). Default: {DEFAULT_PSO_DAMP_ADAM}."
         ),
     )
     parser.add_argument(
@@ -1187,15 +1329,39 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
         print(
             f"Note: --jde-* flags are ignored for --algo {algo} (jde only)."
         )
-    pso_opts_nondefault = (
+    pso_move_opts_nondefault = (
         float(args.pso_inertia) != DEFAULT_PSO_INERTIA
         or float(args.pso_cognitive) != DEFAULT_PSO_COGNITIVE
         or float(args.pso_social) != DEFAULT_PSO_SOCIAL
         or float(args.pso_max_velocity) != DEFAULT_PSO_MAX_VELOCITY
     )
-    if algo != "pso" and pso_opts_nondefault:
+    pso_robust_opts_nondefault = (
+        float(args.pso_ema_alpha) != DEFAULT_PSO_EMA_ALPHA
+        or float(args.pso_kappa) != DEFAULT_PSO_KAPPA
+        or float(args.pso_lcb_beta) != DEFAULT_PSO_LCB_BETA
+        or str(args.pso_gbest_mode) != DEFAULT_PSO_GBEST_MODE
+        or bool(args.pso_soft_accept) != DEFAULT_PSO_SOFT_ACCEPT
+        or float(args.pso_t0) != DEFAULT_PSO_T0
+        or float(args.pso_t_gamma) != DEFAULT_PSO_T_GAMMA
+        or str(args.pso_test) != DEFAULT_PSO_TEST
+        or str(args.pso_reeval_mode) != DEFAULT_PSO_REEVAL_MODE
+        or float(args.pso_gate_band_kappa) != DEFAULT_PSO_GATE_BAND_KAPPA
+        or float(args.pso_reeval_prob) != DEFAULT_PSO_REEVAL_PROB
+        or float(args.pso_damp_eta0) != DEFAULT_PSO_DAMP_ETA0
+        or float(args.pso_damp_eta_gamma) != DEFAULT_PSO_DAMP_ETA_GAMMA
+        or bool(args.pso_damp_adam) != DEFAULT_PSO_DAMP_ADAM
+    )
+    if algo not in PSO_ALGOS and (
+        pso_move_opts_nondefault or pso_robust_opts_nondefault
+    ):
         print(
-            f"Note: --pso-* flags are ignored for --algo {algo} (pso only)."
+            f"Note: --pso-* flags are ignored for --algo {algo} "
+            "(pso / pso_robust only)."
+        )
+    elif algo == "pso" and pso_robust_opts_nondefault:
+        print(
+            "Note: robust bookkeeping flags (--pso-ema-alpha, --pso-kappa, …) "
+            "are ignored for --algo pso; use --algo pso_robust."
         )
 
     popsize = _resolve_popsize(args, problem.n_var)
@@ -1281,13 +1447,19 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
             f"jde_tau_f={args.jde_tau_f}  jde_tau_cr={args.jde_tau_cr}  "
             f"jde_elitism={args.jde_elitism}"
         )
-    if algo == "pso":
+    if algo in PSO_ALGOS:
         es_banner += (
             f"  pso_inertia={args.pso_inertia}  "
             f"pso_cognitive={args.pso_cognitive}  "
             f"pso_social={args.pso_social}  "
             f"pso_max_velocity={args.pso_max_velocity}"
         )
+        if algo == "pso_robust":
+            es_banner += (
+                f"  ema_α={args.pso_ema_alpha}  "
+                f"κ={args.pso_kappa}  gbest={args.pso_gbest_mode}  "
+                f"reeval={args.pso_reeval_mode}  test={args.pso_test}"
+            )
 
     sol_tag = "best" if algo in POPULATION_BASED_ALGOS else "mean"
     w_str = ",".join(f"{x:g}" for x in args.scalar_weights_resolved)
@@ -1349,6 +1521,20 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
             pso_cognitive=args.pso_cognitive,
             pso_social=args.pso_social,
             pso_max_velocity=args.pso_max_velocity,
+            pso_ema_alpha=args.pso_ema_alpha,
+            pso_kappa=args.pso_kappa,
+            pso_lcb_beta=args.pso_lcb_beta,
+            pso_gbest_mode=args.pso_gbest_mode,
+            pso_soft_accept=args.pso_soft_accept,
+            pso_t0=args.pso_t0,
+            pso_t_gamma=args.pso_t_gamma,
+            pso_test=args.pso_test,
+            pso_reeval_mode=args.pso_reeval_mode,
+            pso_gate_band_kappa=args.pso_gate_band_kappa,
+            pso_reeval_prob=args.pso_reeval_prob,
+            pso_damp_eta0=args.pso_damp_eta0,
+            pso_damp_eta_gamma=args.pso_damp_eta_gamma,
+            pso_damp_adam=args.pso_damp_adam,
         )
     except Exception:
         finish_wandb()

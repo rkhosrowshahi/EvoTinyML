@@ -45,6 +45,7 @@ EVOSAX_SOO_ALGOS = {
     "de": ("DifferentialEvolution", "DE"),
     "jde": ("JDE", "jDE"),
     "pso": ("PSO", "PSO"),
+    "pso_robust": ("RobustPSO", "RobustPSO"),
 }
 
 # Algos that require an even population size (antithetic / paired sampling).
@@ -60,7 +61,8 @@ SIGMA_SCHEDULE_ALGOS = frozenset({"open_es", "sparse_open_es", "asebo"})
 # Self-adapted per-parameter σ (no schedule; --es-sigma-lr/-min/-max instead).
 ADAPTIVE_SIGMA_ALGOS = frozenset({"ada_open_es"})
 # Population-based (init with evaluated population; report best member).
-POPULATION_BASED_ALGOS = frozenset({"de", "jde", "pso"})
+POPULATION_BASED_ALGOS = frozenset({"de", "jde", "pso", "pso_robust"})
+PSO_ALGOS = frozenset({"pso", "pso_robust"})
 
 # Momentum (--es-optim-momentum) applies to sgd and rmsprop only.
 ES_OPTIMS = ("sgd", "adam", "adamw", "rmsprop")
@@ -107,6 +109,21 @@ DEFAULT_PSO_COGNITIVE = 1.5
 DEFAULT_PSO_SOCIAL = 2.0
 # Clamp each velocity component to [-v_max, v_max].
 DEFAULT_PSO_MAX_VELOCITY = 0.2
+# RobustPSO bookkeeping under mini-batch fitness noise (--algo pso_robust).
+DEFAULT_PSO_EMA_ALPHA = 0.3
+DEFAULT_PSO_KAPPA = 1.25
+DEFAULT_PSO_LCB_BETA = 1.0
+DEFAULT_PSO_GBEST_MODE = "lcb"  # lcb | thompson | argmin
+DEFAULT_PSO_SOFT_ACCEPT = False
+DEFAULT_PSO_T0 = 1.0
+DEFAULT_PSO_T_GAMMA = 0.99
+DEFAULT_PSO_TEST = "ttest"  # ttest | wilcoxon
+DEFAULT_PSO_REEVAL_MODE = "full"  # full | g_only | gated | stochastic
+DEFAULT_PSO_GATE_BAND_KAPPA = 1.0
+DEFAULT_PSO_REEVAL_PROB = 0.5
+DEFAULT_PSO_DAMP_ETA0 = 1.0
+DEFAULT_PSO_DAMP_ETA_GAMMA = 1.0
+DEFAULT_PSO_DAMP_ADAM = False
 
 
 def default_es_popsize(n_var: int) -> int:
@@ -484,6 +501,20 @@ def _build_evosax(
     pso_cognitive: float = DEFAULT_PSO_COGNITIVE,
     pso_social: float = DEFAULT_PSO_SOCIAL,
     pso_max_velocity: float = DEFAULT_PSO_MAX_VELOCITY,
+    pso_ema_alpha: float = DEFAULT_PSO_EMA_ALPHA,
+    pso_kappa: float = DEFAULT_PSO_KAPPA,
+    pso_lcb_beta: float = DEFAULT_PSO_LCB_BETA,
+    pso_gbest_mode: str = DEFAULT_PSO_GBEST_MODE,
+    pso_soft_accept: bool = DEFAULT_PSO_SOFT_ACCEPT,
+    pso_t0: float = DEFAULT_PSO_T0,
+    pso_t_gamma: float = DEFAULT_PSO_T_GAMMA,
+    pso_test: str = DEFAULT_PSO_TEST,
+    pso_reeval_mode: str = DEFAULT_PSO_REEVAL_MODE,
+    pso_gate_band_kappa: float = DEFAULT_PSO_GATE_BAND_KAPPA,
+    pso_reeval_prob: float = DEFAULT_PSO_REEVAL_PROB,
+    pso_damp_eta0: float = DEFAULT_PSO_DAMP_ETA0,
+    pso_damp_eta_gamma: float = DEFAULT_PSO_DAMP_ETA_GAMMA,
+    pso_damp_adam: bool = DEFAULT_PSO_DAMP_ADAM,
 ):
     """Construct an evosax ES and params; may bump popsize for even-pop algos."""
     from evosax import algorithms as evosax_algorithms
@@ -498,7 +529,12 @@ def _build_evosax(
         xNES,
     )
     from evotinyml.soo.pso_fixed import FixedPSO
-
+    from evotinyml.soo.pso_robust import (
+        GBEST_ARGMIN,
+        GBEST_LCB,
+        GBEST_THOMPSON,
+        RobustPSO,
+    )
     if algo not in EVOSAX_SOO_ALGOS:
         raise ValueError(
             f"Unknown SOO algo: {algo!r}. Use one of {tuple(EVOSAX_SOO_ALGOS)}."
@@ -521,6 +557,8 @@ def _build_evosax(
         Cls = JDE
     elif algo == "pso":
         Cls = FixedPSO
+    elif algo == "pso_robust":
+        Cls = RobustPSO
     else:
         Cls = getattr(evosax_algorithms, cls_name)
     sigma = float(init_sigma)
@@ -534,8 +572,8 @@ def _build_evosax(
         population_size += 1
     if algo in {"de", "jde"} and population_size < 4:
         raise ValueError(f"{display_name} requires popsize >= 4, got {population_size}")
-    if algo == "pso" and population_size < 2:
-        raise ValueError(f"PSO requires popsize >= 2, got {population_size}")
+    if algo in PSO_ALGOS and population_size < 2:
+        raise ValueError(f"{display_name} requires popsize >= 2, got {population_size}")
 
     kwargs: dict[str, Any] = {
         "population_size": population_size,
@@ -628,6 +666,31 @@ def _build_evosax(
             social_coeff=float(pso_social),
             v_max=v_max,
         )
+    if algo == "pso_robust":
+        v_max = float(pso_max_velocity)
+        if v_max <= 0.0:
+            raise ValueError(f"pso_max_velocity must be > 0, got {v_max}")
+        mode_name = str(pso_gbest_mode).lower()
+        mode_map = {
+            "argmin": GBEST_ARGMIN,
+            "lcb": GBEST_LCB,
+            "thompson": GBEST_THOMPSON,
+        }
+        if mode_name not in mode_map:
+            raise ValueError(
+                f"pso_gbest_mode must be one of {tuple(mode_map)}, got {pso_gbest_mode!r}"
+            )
+        params = params.replace(
+            inertia_coeff=float(pso_inertia),
+            cognitive_coeff=float(pso_cognitive),
+            social_coeff=float(pso_social),
+            v_max=v_max,
+            gbest_mode=int(mode_map[mode_name]),
+            lcb_beta=float(pso_lcb_beta),
+            damp_eta0=float(pso_damp_eta0),
+            damp_eta_gamma=float(pso_damp_eta_gamma),
+            damp_adam=bool(pso_damp_adam),
+        )
 
     return es, params, population_size, display_name
 
@@ -692,18 +755,32 @@ def run_soo_es(
     pso_cognitive: float = DEFAULT_PSO_COGNITIVE,
     pso_social: float = DEFAULT_PSO_SOCIAL,
     pso_max_velocity: float = DEFAULT_PSO_MAX_VELOCITY,
+    pso_ema_alpha: float = DEFAULT_PSO_EMA_ALPHA,
+    pso_kappa: float = DEFAULT_PSO_KAPPA,
+    pso_lcb_beta: float = DEFAULT_PSO_LCB_BETA,
+    pso_gbest_mode: str = DEFAULT_PSO_GBEST_MODE,
+    pso_soft_accept: bool = DEFAULT_PSO_SOFT_ACCEPT,
+    pso_t0: float = DEFAULT_PSO_T0,
+    pso_t_gamma: float = DEFAULT_PSO_T_GAMMA,
+    pso_test: str = DEFAULT_PSO_TEST,
+    pso_reeval_mode: str = DEFAULT_PSO_REEVAL_MODE,
+    pso_gate_band_kappa: float = DEFAULT_PSO_GATE_BAND_KAPPA,
+    pso_reeval_prob: float = DEFAULT_PSO_REEVAL_PROB,
+    pso_damp_eta0: float = DEFAULT_PSO_DAMP_ETA0,
+    pso_damp_eta_gamma: float = DEFAULT_PSO_DAMP_ETA_GAMMA,
+    pso_damp_adam: bool = DEFAULT_PSO_DAMP_ADAM,
 ) -> SOOESResult:
     """Ask / eval / tell loop for evosax SOO algorithms.
 
     Fitness is evaluated with torch (no JAX NN). evosax **minimizes** the
     fitness values passed to ``tell``. Train logging and test validation use
     the distribution **mean** for ES algos, or the **best population member**
-    for DE / jDE / PSO.
+    for DE / jDE / PSO / RobustPSO.
 
     Function Evaluations: ES counts ``steps * popsize``. Population-based
     algos (DE / jDE / PSO) also evaluate the initial population (``popsize``),
     then run ``max(0, steps - 1)`` ask/tell generations so total FEs stay near
-    ``steps * popsize``.
+    ``steps * popsize``. RobustPSO also counts incumbent / gbest re-evals.
     """
     algo = algo.lower()
     soo = getattr(problem, "soo_fitness", None)
@@ -781,7 +858,53 @@ def run_soo_es(
         pso_cognitive=pso_cognitive,
         pso_social=pso_social,
         pso_max_velocity=pso_max_velocity,
+        pso_lcb_beta=pso_lcb_beta,
+        pso_gbest_mode=pso_gbest_mode,
+        pso_damp_eta0=pso_damp_eta0,
+        pso_damp_eta_gamma=pso_damp_eta_gamma,
+        pso_damp_adam=pso_damp_adam,
     )
+
+    robust_cfg = None
+    if algo == "pso_robust":
+        from evotinyml.soo.pso_robust import RobustPSOConfig
+
+        if not soo.supports_per_sample():
+            raise TypeError(
+                "pso_robust requires per-sample losses; use a CE-based fitness "
+                f"(got {type(getattr(soo, 'metrics', soo)).__name__})."
+            )
+        reeval = str(pso_reeval_mode).lower()
+        test_name = str(pso_test).lower()
+        gbest = str(pso_gbest_mode).lower()
+        if reeval not in {"full", "g_only", "gated", "stochastic"}:
+            raise ValueError(f"pso_reeval_mode invalid: {pso_reeval_mode!r}")
+        if test_name not in {"ttest", "wilcoxon"}:
+            raise ValueError(f"pso_test invalid: {pso_test!r}")
+        if gbest not in {"lcb", "thompson", "argmin"}:
+            raise ValueError(f"pso_gbest_mode invalid: {pso_gbest_mode!r}")
+        if not (0.0 < float(pso_ema_alpha) <= 1.0):
+            raise ValueError(f"pso_ema_alpha must be in (0, 1], got {pso_ema_alpha}")
+        if float(pso_kappa) < 0.0:
+            raise ValueError(f"pso_kappa must be >= 0, got {pso_kappa}")
+        robust_cfg = RobustPSOConfig(
+            enabled=True,
+            ema_alpha=float(pso_ema_alpha),
+            kappa=float(pso_kappa),
+            lcb_beta=float(pso_lcb_beta),
+            gbest_mode=gbest,  # type: ignore[arg-type]
+            soft_accept=bool(pso_soft_accept),
+            T0=float(pso_t0),
+            T_gamma=float(pso_t_gamma),
+            test=test_name,  # type: ignore[arg-type]
+            reeval_mode=reeval,  # type: ignore[arg-type]
+            gate_band_kappa=float(pso_gate_band_kappa),
+            reeval_prob=float(pso_reeval_prob),
+            damp_eta0=float(pso_damp_eta0),
+            damp_eta_gamma=float(pso_damp_eta_gamma),
+            damp_adam=bool(pso_damp_adam),
+        )
+
     sigma_schedule = (
         build_es_sigma_schedule(
             es_sigma_scheduler,
@@ -901,26 +1024,130 @@ def run_soo_es(
 
         # Sample minibatch(es) for this generation; shared by pop + reported solution.
         problem.sample_eval_pool()
-        fitness = soo.evaluate(X, details=False)
-        if population_based:
-            n_eval += popsize
-        else:
-            n_eval = gen * popsize
-        state, _es_metrics = es.tell(
-            key_tell, jnp.asarray(X, dtype=jnp.float32), jnp.asarray(fitness), state, params
-        )
 
-        sol_x = _state_solution(algo, state, xl, xu)
-        sol_details = soo.evaluate_one(sol_x)
-        sol_details.update(_maybe_ce_train_details(problem, sol_x))
-        if algo == "jde":
-            sol_details.update(_jde_control_means(state))
-        if algo in ADAPTIVE_SIGMA_ALGOS:
-            sol_details.update(_ada_sigma_stats(state))
-        sol_f = float(sol_details["f"])
+        if robust_cfg is not None:
+            from evotinyml.soo.pso_robust import (
+                apply_robust_bookkeeping,
+                choose_reeval_mask,
+                sample_se,
+                select_gbest_index,
+            )
+
+            cand_losses = soo.evaluate_per_sample(X)
+            fitness = cand_losses.mean(axis=1)
+            cand_se = np.array(
+                [sample_se(cand_losses[i]) for i in range(X.shape[0])],
+                dtype=np.float64,
+            )
+            pbest = np.asarray(state.population_best, dtype=np.float64)
+            phi = np.asarray(state.fitness_best, dtype=np.float64)
+            se = np.asarray(state.fitness_se, dtype=np.float64)
+            g_pos = np.asarray(state.best_solution, dtype=np.float64)
+            phi_g = float(state.best_fitness)
+            se_g = 0.0
+
+            reeval_mask = choose_reeval_mask(
+                fitness,
+                phi,
+                cand_se,
+                mode=robust_cfg.reeval_mode,
+                gate_band_kappa=robust_cfg.gate_band_kappa,
+                reeval_prob=robust_cfg.reeval_prob,
+                gbest_idx=int(np.argmin(phi)),
+                rng=rng,
+            )
+            # Always re-eval the uncertainty-aware challenger so g promotion
+            # can run a paired co-batch test (needed for g_only / sparse modes).
+            chall_idx = select_gbest_index(
+                phi,
+                se,
+                mode=robust_cfg.gbest_mode,
+                beta=robust_cfg.lcb_beta,
+                rng=rng,
+            )
+            reeval_mask[chall_idx] = True
+
+            pbest_losses = None
+            n_extra = 0
+            if reeval_mask.any():
+                idx = np.flatnonzero(reeval_mask)
+                pbest_losses = np.zeros_like(cand_losses)
+                pbest_losses[idx] = soo.evaluate_per_sample(pbest[idx])
+                n_extra += int(idx.size)
+            g_losses = soo.evaluate_per_sample(g_pos[None, :])[0]
+            n_extra += 1
+
+            if population_based:
+                n_eval += popsize + n_extra
+            else:
+                n_eval = gen * popsize + n_extra
+
+            book = apply_robust_bookkeeping(
+                population=X,
+                cand_losses=cand_losses,
+                population_best=pbest,
+                fitness_best=phi,
+                fitness_se=se,
+                best_solution=g_pos,
+                best_fitness=phi_g,
+                best_se=se_g,
+                config=robust_cfg,
+                gen=gen,
+                rng=rng,
+                pbest_losses=pbest_losses,
+                g_losses=g_losses,
+                reeval_mask=reeval_mask,
+            )
+            state, _es_metrics = es.robust_tell(
+                key_tell,
+                jnp.asarray(X, dtype=jnp.float32),
+                jnp.asarray(fitness, dtype=jnp.float32),
+                state,
+                params,
+                population_best=jnp.asarray(book.population_best, dtype=jnp.float32),
+                fitness_best=jnp.asarray(book.fitness_best, dtype=jnp.float32),
+                fitness_se=jnp.asarray(book.fitness_se, dtype=jnp.float32),
+                best_solution=jnp.asarray(book.best_solution, dtype=jnp.float32),
+                best_fitness=float(book.best_fitness),
+            )
+            # Report filtered φ_g (not the raw running min).
+            sol_x = np.clip(np.asarray(book.best_solution, dtype=np.float64), xl, xu)
+            sol_details = {
+                "f": float(book.best_fitness),
+                "phi_g": float(book.best_fitness),
+                "se_g": float(book.best_se),
+                "pbest_replaced": float(book.n_pbest_replaced),
+                "n_reeval": float(book.n_reeval),
+            }
+            sol_details.update(_maybe_ce_train_details(problem, sol_x))
+            sol_f = float(book.best_fitness)
+            pop_best_f = float(np.min(book.fitness_best))
+        else:
+            fitness = soo.evaluate(X, details=False)
+            if population_based:
+                n_eval += popsize
+            else:
+                n_eval = gen * popsize
+            state, _es_metrics = es.tell(
+                key_tell,
+                jnp.asarray(X, dtype=jnp.float32),
+                jnp.asarray(fitness),
+                state,
+                params,
+            )
+
+            sol_x = _state_solution(algo, state, xl, xu)
+            sol_details = soo.evaluate_one(sol_x)
+            sol_details.update(_maybe_ce_train_details(problem, sol_x))
+            if algo == "jde":
+                sol_details.update(_jde_control_means(state))
+            if algo in ADAPTIVE_SIGMA_ALGOS:
+                sol_details.update(_ada_sigma_stats(state))
+            sol_f = float(sol_details["f"])
+            pop_best_f = float(np.min(fitness))
+
         mean_f_history[gen] = sol_f
 
-        pop_best_f = float(np.min(fitness))
         cur_sigma = _current_sigma_scalar(algo, state, sigma_schedule, gen - 1)
         cur_lr = sigma_at(lr_schedule, gen - 1) if lr_schedule is not None else None
         _log_soo_step(
@@ -1111,8 +1338,24 @@ def build_soo_wandb_config(
     pso_cognitive = getattr(args, "pso_cognitive", DEFAULT_PSO_COGNITIVE)
     pso_social = getattr(args, "pso_social", DEFAULT_PSO_SOCIAL)
     pso_max_velocity = getattr(args, "pso_max_velocity", DEFAULT_PSO_MAX_VELOCITY)
+    pso_ema_alpha = getattr(args, "pso_ema_alpha", DEFAULT_PSO_EMA_ALPHA)
+    pso_kappa = getattr(args, "pso_kappa", DEFAULT_PSO_KAPPA)
+    pso_lcb_beta = getattr(args, "pso_lcb_beta", DEFAULT_PSO_LCB_BETA)
+    pso_gbest_mode = getattr(args, "pso_gbest_mode", DEFAULT_PSO_GBEST_MODE)
+    pso_soft_accept = getattr(args, "pso_soft_accept", DEFAULT_PSO_SOFT_ACCEPT)
+    pso_t0 = getattr(args, "pso_t0", DEFAULT_PSO_T0)
+    pso_t_gamma = getattr(args, "pso_t_gamma", DEFAULT_PSO_T_GAMMA)
+    pso_test = getattr(args, "pso_test", DEFAULT_PSO_TEST)
+    pso_reeval_mode = getattr(args, "pso_reeval_mode", DEFAULT_PSO_REEVAL_MODE)
+    pso_gate_band_kappa = getattr(
+        args, "pso_gate_band_kappa", DEFAULT_PSO_GATE_BAND_KAPPA
+    )
+    pso_reeval_prob = getattr(args, "pso_reeval_prob", DEFAULT_PSO_REEVAL_PROB)
+    pso_damp_eta0 = getattr(args, "pso_damp_eta0", DEFAULT_PSO_DAMP_ETA0)
+    pso_damp_eta_gamma = getattr(args, "pso_damp_eta_gamma", DEFAULT_PSO_DAMP_ETA_GAMMA)
+    pso_damp_adam = getattr(args, "pso_damp_adam", DEFAULT_PSO_DAMP_ADAM)
     val_solution = "de_best" if algo in POPULATION_BASED_ALGOS else "es_mean"
-    if algo in {"jde", "pso"}:
+    if algo in {"jde", "pso", "pso_robust"}:
         library = f"evosax+{algo}"
     else:
         library = "evosax"
@@ -1158,6 +1401,20 @@ def build_soo_wandb_config(
         "pso_cognitive": pso_cognitive,
         "pso_social": pso_social,
         "pso_max_velocity": pso_max_velocity,
+        "pso_ema_alpha": pso_ema_alpha,
+        "pso_kappa": pso_kappa,
+        "pso_lcb_beta": pso_lcb_beta,
+        "pso_gbest_mode": pso_gbest_mode,
+        "pso_soft_accept": pso_soft_accept,
+        "pso_t0": pso_t0,
+        "pso_t_gamma": pso_t_gamma,
+        "pso_test": pso_test,
+        "pso_reeval_mode": pso_reeval_mode,
+        "pso_gate_band_kappa": pso_gate_band_kappa,
+        "pso_reeval_prob": pso_reeval_prob,
+        "pso_damp_eta0": pso_damp_eta0,
+        "pso_damp_eta_gamma": pso_damp_eta_gamma,
+        "pso_damp_adam": pso_damp_adam,
         "steps": args.steps,
         "evals": getattr(args, "evals", None),
         "popsize": popsize,
@@ -1204,6 +1461,20 @@ def build_soo_wandb_config(
             "pso_cognitive": pso_cognitive,
             "pso_social": pso_social,
             "pso_max_velocity": pso_max_velocity,
+            "pso_ema_alpha": pso_ema_alpha,
+            "pso_kappa": pso_kappa,
+            "pso_lcb_beta": pso_lcb_beta,
+            "pso_gbest_mode": pso_gbest_mode,
+            "pso_soft_accept": pso_soft_accept,
+            "pso_t0": pso_t0,
+            "pso_t_gamma": pso_t_gamma,
+            "pso_test": pso_test,
+            "pso_reeval_mode": pso_reeval_mode,
+            "pso_gate_band_kappa": pso_gate_band_kappa,
+            "pso_reeval_prob": pso_reeval_prob,
+            "pso_damp_eta0": pso_damp_eta0,
+            "pso_damp_eta_gamma": pso_damp_eta_gamma,
+            "pso_damp_adam": pso_damp_adam,
 
             "library": library,
             "val_solution": val_solution,

@@ -264,15 +264,18 @@ class CrossEntropyMetrics:
         self.n_obj = 1
         self.fitness_name = "erm_ce"
 
-    def mean_ce_for_weights(self, flat: np.ndarray) -> float:
+    def per_sample_for_weights(self, flat: np.ndarray) -> np.ndarray:
+        """Per-example CE on the shared eval pool (shape ``(m,)``)."""
         self.problem.set_weights(flat)
         losses: list[torch.Tensor] = []
         with torch.no_grad():
             for inputs, targets in self.problem.eval_batch_pool:
                 logits = self.problem.model(inputs)
                 losses.append(F.cross_entropy(logits, targets, reduction="none"))
-        all_losses = torch.cat(losses, dim=0)
-        return float(all_losses.mean().item())
+        return torch.cat(losses, dim=0).detach().cpu().numpy().astype(np.float64)
+
+    def mean_ce_for_weights(self, flat: np.ndarray) -> float:
+        return float(self.per_sample_for_weights(flat).mean())
 
     def scalar_for_weights(self, flat: np.ndarray) -> float:
         return self.mean_ce_for_weights(flat)
@@ -441,14 +444,22 @@ class CrossEntropyL1Metrics:
         self.n_obj = 2
         self.fitness_name = "ce_l1"
 
-    def vector_for_weights(self, flat: np.ndarray) -> tuple[np.ndarray, float, float]:
+    def per_sample_for_weights(self, flat: np.ndarray) -> np.ndarray:
+        """Per-example CE on the shared eval pool (shape ``(m,)``).
+
+        L1 is constant across examples; SOOFitness folds it into the
+        scalarized per-sample vector when forming paired differences.
+        """
         self.problem.set_weights(flat)
         losses: list[torch.Tensor] = []
         with torch.no_grad():
             for inputs, targets in self.problem.eval_batch_pool:
                 logits = self.problem.model(inputs)
                 losses.append(F.cross_entropy(logits, targets, reduction="none"))
-        ce = float(torch.cat(losses, dim=0).mean().item())
+        return torch.cat(losses, dim=0).detach().cpu().numpy().astype(np.float64)
+
+    def vector_for_weights(self, flat: np.ndarray) -> tuple[np.ndarray, float, float]:
+        ce = float(self.per_sample_for_weights(flat).mean())
         l1 = mean_abs_weights(flat)
         return np.asarray([ce, l1], dtype=np.float64), ce, l1
 
@@ -709,3 +720,40 @@ class SOOFitness:
         row["f"] = float(self._scalar_weights[0] * float(row["f"]))
         row["w0"] = float(self._scalar_weights[0])
         return row
+
+    def supports_per_sample(self) -> bool:
+        """True when the underlying metrics expose per-example losses."""
+        return hasattr(self.metrics, "per_sample_for_weights")
+
+    def evaluate_per_sample(self, X: np.ndarray) -> np.ndarray:
+        """Per-example losses on the shared eval pool.
+
+        Returns shape ``(n, m)`` for ``n`` candidates and pool size ``m``.
+        Scalarization matches ``evaluate`` / ``_scalar_one`` when possible.
+        """
+        if not self.supports_per_sample():
+            raise TypeError(
+                f"Metrics {type(self.metrics).__name__} do not support "
+                "per-sample losses (needed for robust PSO bookkeeping)."
+            )
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim == 1:
+            X = X[None, :]
+        rows: list[np.ndarray] = []
+        w = np.asarray(self._scalar_weights, dtype=np.float64)
+        name = self._base_fitness_name
+        for i in range(X.shape[0]):
+            per = np.asarray(
+                self.metrics.per_sample_for_weights(X[i]), dtype=np.float64
+            ).ravel()
+            if name == "ce_l1" and self.n_obj == 2:
+                l1 = mean_abs_weights(X[i])
+                per = w[0] * per + w[1] * l1
+            elif self.n_obj == 1:
+                per = w[0] * per
+            else:
+                raise TypeError(
+                    f"Per-sample scalarization not defined for fitness {name!r}."
+                )
+            rows.append(per)
+        return np.stack(rows, axis=0)

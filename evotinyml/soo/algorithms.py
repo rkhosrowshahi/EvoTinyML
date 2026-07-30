@@ -13,4 +13,5 @@ SOO_ALGORITHMS = (
     "de",
     "jde",
     "pso",
+    "pso_robust",
 )

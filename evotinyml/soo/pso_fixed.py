@@ -12,6 +12,8 @@ NaN fitness fallback in ``_ask``.
 
 Additionally clamps velocity to ``[-v_max, v_max]`` and uses per-dimension
 ``r1``/``r2``.
+
+For mini-batch-robust bookkeeping see :mod:`evotinyml.soo.pso_robust`.
 """
 
 from __future__ import annotations
@@ -109,10 +111,6 @@ class FixedPSO(_PSO):
         v_max = params.v_max
 
         def _ask_member(key, velocity, member, member_best):
-            # Per-dimension random coefficients (classic Kennedy & Eberhart).
-            # key_r1, key_r2 = jax.random.split(key)
-            # r1 = jax.random.uniform(key_r1, (self.num_dims,))
-            # r2 = jax.random.uniform(key_r2, (self.num_dims,))
             r1, r2 = jax.random.uniform(key, (2,))
             inertia = params.inertia_coeff * velocity
             cognitive = params.cognitive_coeff * r1 * (member_best - member)
