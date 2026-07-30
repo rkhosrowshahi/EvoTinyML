@@ -107,6 +107,8 @@ DEFAULT_PSO_COGNITIVE = 1.5
 DEFAULT_PSO_SOCIAL = 2.0
 # Clamp each velocity component to [-v_max, v_max].
 DEFAULT_PSO_MAX_VELOCITY = 0.2
+# When True, ask returns [offspring; personal-best archive] (2×popsize FEs/gen).
+DEFAULT_EA_COEVAL = False
 
 
 def default_es_popsize(n_var: int) -> int:
@@ -484,6 +486,7 @@ def _build_evosax(
     pso_cognitive: float = DEFAULT_PSO_COGNITIVE,
     pso_social: float = DEFAULT_PSO_SOCIAL,
     pso_max_velocity: float = DEFAULT_PSO_MAX_VELOCITY,
+    ea_coeval: bool = DEFAULT_EA_COEVAL,
 ):
     """Construct an evosax ES and params; may bump popsize for even-pop algos."""
     from evosax import algorithms as evosax_algorithms
@@ -570,6 +573,8 @@ def _build_evosax(
         kwargs["subspace_dims"] = dims
     if algo == "sparse_open_es":
         kwargs["mask_prob"] = float(sparse_es_mask_prob)
+    if algo == "pso":
+        kwargs["ea_coeval"] = bool(ea_coeval)
 
     es = Cls(**kwargs)
     params = es.default_params
@@ -656,6 +661,7 @@ def run_soo_es(
     algo: str = "cmaes",
     steps: int,
     popsize: int | None = None,
+    max_evals: int | None = None,
     init: str = "gaussian",
     init_sigma: float = 0.1,
     seed: int = 1,
@@ -692,6 +698,7 @@ def run_soo_es(
     pso_cognitive: float = DEFAULT_PSO_COGNITIVE,
     pso_social: float = DEFAULT_PSO_SOCIAL,
     pso_max_velocity: float = DEFAULT_PSO_MAX_VELOCITY,
+    ea_coeval: bool = DEFAULT_EA_COEVAL,
 ) -> SOOESResult:
     """Ask / eval / tell loop for evosax SOO algorithms.
 
@@ -700,10 +707,10 @@ def run_soo_es(
     the distribution **mean** for ES algos, or the **best population member**
     for DE / jDE / PSO.
 
-    Function Evaluations: ES counts ``steps * popsize``. Population-based
-    algos (DE / jDE / PSO) also evaluate the initial population (``popsize``),
-    then run ``max(0, steps - 1)`` ask/tell generations so total FEs stay near
-    ``steps * popsize``.
+    Function Evaluations: each ``ask`` costs ``len(candidates)`` FEs (PSO with
+    ``ea_coeval`` returns ``2 * popsize``). Population-based algos also evaluate
+    the initial population (``popsize``), then run ask/tell generations until
+    the next ask would exceed ``max_evals`` (default ``steps * popsize``).
     """
     algo = algo.lower()
     soo = getattr(problem, "soo_fitness", None)
@@ -721,6 +728,11 @@ def run_soo_es(
     steps = int(steps)
     if steps < 0:
         raise ValueError(f"steps must be >= 0, got {steps}")
+    if max_evals is None:
+        max_evals = steps * popsize
+    max_evals = int(max_evals)
+    if max_evals < 1:
+        raise ValueError(f"max_evals must be >= 1, got {max_evals}")
 
     needs_epoch = False
     if algo in SIGMA_SCHEDULE_ALGOS and es_sigma_scheduler.lower() in {
@@ -781,6 +793,7 @@ def run_soo_es(
         pso_cognitive=pso_cognitive,
         pso_social=pso_social,
         pso_max_velocity=pso_max_velocity,
+        ea_coeval=ea_coeval,
     )
     sigma_schedule = (
         build_es_sigma_schedule(
@@ -812,11 +825,15 @@ def run_soo_es(
     xu = float(np.asarray(problem.xu).reshape(-1)[0]) if problem.xu is not None else 10.0
 
     # DE consumes one generation evaluating the initial population; remaining
-    # ask/tell rounds use the rest of the FE budget.
+    # ask/tell rounds use the rest of the FE budget (capped by max_evals).
     ask_steps = max(0, steps - 1) if population_based else steps
-    mean_f_history = np.empty(ask_steps + 1, dtype=np.float64)
+    mean_f_hist: list[float] = []
 
     if population_based:
+        if popsize > max_evals:
+            raise ValueError(
+                f"Initial population ({popsize}) exceeds max_evals ({max_evals})"
+            )
         pop0 = _init_population(
             n_var,
             popsize,
@@ -827,7 +844,7 @@ def run_soo_es(
         )
         pop0 = np.clip(pop0, xl, xu)
         fit0 = soo.evaluate(pop0, details=False)
-        n_eval = popsize
+        n_eval = int(pop0.shape[0])
         state = es.init(
             key_init,
             jnp.asarray(pop0, dtype=jnp.float32),
@@ -864,7 +881,8 @@ def run_soo_es(
         sol_f = float(sol_details["f"])
         init_pop_best = None
 
-    mean_f_history[0] = sol_f
+    mean_f_hist.append(sol_f)
+    completed_steps = 0
     _log_soo_step(
         step=0,
         n_eval=n_eval,
@@ -898,14 +916,14 @@ def run_soo_es(
         population, state = es.ask(key_ask, state, params)
         X = np.asarray(population, dtype=np.float64)
         X = np.clip(X, xl, xu)
+        n_ask = int(X.shape[0])
+        if n_eval + n_ask > max_evals:
+            break
 
         # Sample minibatch(es) for this generation; shared by pop + reported solution.
         problem.sample_eval_pool()
         fitness = soo.evaluate(X, details=False)
-        if population_based:
-            n_eval += popsize
-        else:
-            n_eval = gen * popsize
+        n_eval += n_ask
         state, _es_metrics = es.tell(
             key_tell, jnp.asarray(X, dtype=jnp.float32), jnp.asarray(fitness), state, params
         )
@@ -918,9 +936,11 @@ def run_soo_es(
         if algo in ADAPTIVE_SIGMA_ALGOS:
             sol_details.update(_ada_sigma_stats(state))
         sol_f = float(sol_details["f"])
-        mean_f_history[gen] = sol_f
+        mean_f_hist.append(sol_f)
+        completed_steps = gen
 
-        pop_best_f = float(np.min(fitness))
+        # With PSO ea_coeval, ask is [offspring; pbests]; report offspring best only.
+        pop_best_f = float(np.min(fitness[:popsize]))
         cur_sigma = _current_sigma_scalar(algo, state, sigma_schedule, gen - 1)
         cur_lr = sigma_at(lr_schedule, gen - 1) if lr_schedule is not None else None
         _log_soo_step(
@@ -948,15 +968,35 @@ def run_soo_es(
                 opt_step=gen,
                 use_wandb=use_wandb,
                 verbose=verbose,
-                force=(gen == 1) or (gen % val_every == 0) or (gen == ask_steps),
+                force=(gen == 1) or (gen % val_every == 0),
                 solution_label="best" if population_based else "mean",
             )
+
+    if (
+        test_loader is not None
+        and val_every > 0
+        and completed_steps > 0
+        and completed_steps % val_every != 0
+        and completed_steps != 1
+    ):
+        _maybe_validate_mean(
+            problem,
+            sol_x,
+            test_loader,
+            n_classes=n_classes,
+            n_eval=n_eval,
+            opt_step=completed_steps,
+            use_wandb=use_wandb,
+            verbose=verbose,
+            force=True,
+            solution_label="best" if population_based else "mean",
+        )
 
     return SOOESResult(
         X=sol_x,
         f=sol_f,
-        mean_f_history=mean_f_history,
-        steps=ask_steps,
+        mean_f_history=np.asarray(mean_f_hist, dtype=np.float64),
+        steps=completed_steps,
         popsize=popsize,
         fitness_name=fitness_name,
         algo=algo,
@@ -1111,6 +1151,7 @@ def build_soo_wandb_config(
     pso_cognitive = getattr(args, "pso_cognitive", DEFAULT_PSO_COGNITIVE)
     pso_social = getattr(args, "pso_social", DEFAULT_PSO_SOCIAL)
     pso_max_velocity = getattr(args, "pso_max_velocity", DEFAULT_PSO_MAX_VELOCITY)
+    ea_coeval = getattr(args, "ea_coeval", DEFAULT_EA_COEVAL)
     val_solution = "de_best" if algo in POPULATION_BASED_ALGOS else "es_mean"
     if algo in {"jde", "pso"}:
         library = f"evosax+{algo}"
@@ -1158,6 +1199,7 @@ def build_soo_wandb_config(
         "pso_cognitive": pso_cognitive,
         "pso_social": pso_social,
         "pso_max_velocity": pso_max_velocity,
+        "ea_coeval": ea_coeval,
         "steps": args.steps,
         "evals": getattr(args, "evals", None),
         "popsize": popsize,
@@ -1204,6 +1246,7 @@ def build_soo_wandb_config(
             "pso_cognitive": pso_cognitive,
             "pso_social": pso_social,
             "pso_max_velocity": pso_max_velocity,
+            "ea_coeval": ea_coeval,
 
             "library": library,
             "val_solution": val_solution,

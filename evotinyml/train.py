@@ -61,6 +61,7 @@ from evotinyml.soo.es import (
     DEFAULT_JDE_TAU_CR,
     DEFAULT_JDE_TAU_F,
     DEFAULT_PSO_COGNITIVE,
+    DEFAULT_EA_COEVAL,
     DEFAULT_PSO_INERTIA,
     DEFAULT_PSO_MAX_VELOCITY,
     DEFAULT_PSO_SOCIAL,
@@ -559,6 +560,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ea-coeval",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_EA_COEVAL,
+        help=(
+            "PSO: ask returns [offspring; personal-best archive] so both are "
+            "evaluated on the same minibatch (2×popsize FEs/gen); tell replaces "
+            "pbest/gbest using that co-batch fitness. "
+            f"Default: {DEFAULT_EA_COEVAL}."
+        ),
+    )
+    parser.add_argument(
         "--mgda-normalize",
         choices=MGDA_NORMALIZATIONS,
         default=DEFAULT_MGDA_NORMALIZE,
@@ -675,8 +687,10 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Function-evaluation budget (train fitness calls). "
-            "Sets steps = ceil(evals / popsize) (ES/NSGA: one generation costs popsize evals)."
+            "Hard Function Evaluation budget. "
+            "Sets steps = ceil(evals / popsize) as a generation upper bound; "
+            "the run stops before any ask that would exceed this budget "
+            "(counts ask returned size, e.g. 2×popsize with --ea-coeval)."
         ),
     )
     parser.add_argument(
@@ -815,7 +829,8 @@ def _resolve_popsize(args: argparse.Namespace, n_var: int) -> int:
 def _resolve_steps_and_evals(args: argparse.Namespace, popsize: int) -> tuple[int, int]:
     """Resolve ``(steps, evals)`` from ``--steps`` and/or ``--evals``.
 
-    ``--evals`` wins when set: ``steps = ceil(evals / popsize)`` (may exceed budget).
+    ``--evals`` wins when set: ``steps = ceil(evals / popsize)`` is only an
+    upper bound on generations; the run loop must not exceed ``evals`` FEs.
     """
     popsize = int(popsize)
     if popsize < 1:
@@ -826,19 +841,13 @@ def _resolve_steps_and_evals(args: argparse.Namespace, popsize: int) -> tuple[in
         if evals < 1:
             raise SystemExit(f"--evals must be >= 1, got {evals}")
         steps = int(np.ceil(evals / popsize))
-        used = steps * popsize
-        if used > evals:
-            print(
-                f"Note: --evals={evals} -> steps={steps} "
-                f"({used} Function Evaluations)."
-            )
         if args.steps is not None and int(args.steps) != steps:
             print(
                 f"Note: --evals sets steps={steps}; ignoring --steps={args.steps}."
             )
         args.steps = steps
-        args.evals = used
-        return steps, used
+        args.evals = evals
+        return steps, evals
 
     if args.steps is not None:
         steps = int(args.steps)
@@ -1197,6 +1206,10 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
         print(
             f"Note: --pso-* flags are ignored for --algo {algo} (pso only)."
         )
+    if algo != "pso" and bool(args.ea_coeval) != DEFAULT_EA_COEVAL:
+        print(
+            f"Note: --ea-coeval is ignored for --algo {algo} (pso only)."
+        )
 
     popsize = _resolve_popsize(args, problem.n_var)
     steps, evals = _resolve_steps_and_evals(args, popsize)
@@ -1286,7 +1299,8 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
             f"  pso_inertia={args.pso_inertia}  "
             f"pso_cognitive={args.pso_cognitive}  "
             f"pso_social={args.pso_social}  "
-            f"pso_max_velocity={args.pso_max_velocity}"
+            f"pso_max_velocity={args.pso_max_velocity}  "
+            f"ea_coeval={args.ea_coeval}"
         )
 
     sol_tag = "best" if algo in POPULATION_BASED_ALGOS else "mean"
@@ -1318,11 +1332,12 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
             init=args.init,
             init_sigma=args.init_sigma,
             seed=args.seed,
-                val_every=args.val_every,
+            val_every=args.val_every,
             test_loader=test_loader,
             n_classes=num_classes,
             verbose=args.verbose,
             use_wandb=args.wandb,
+            max_evals=evals,
             es_optim=args.es_optim,
             es_optim_lr=args.es_optim_lr,
             es_optim_scheduler=args.es_optim_scheduler,
@@ -1349,6 +1364,7 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
             pso_cognitive=args.pso_cognitive,
             pso_social=args.pso_social,
             pso_max_velocity=args.pso_max_velocity,
+            ea_coeval=args.ea_coeval,
         )
     except Exception:
         finish_wandb()

@@ -75,6 +75,70 @@ def test_pso_clamps_velocity_to_v_max():
     assert np.max(np.abs(vel)) <= v_max + 1e-6
 
 
+def test_pso_ea_coeval_ask_returns_offspring_plus_pbests():
+    """ea_coeval ask stacks offspring and personal-best archive."""
+    n_particles, n_var = 4, 3
+    algo = FixedPSO(
+        population_size=n_particles,
+        solution=jnp.zeros(n_var),
+        ea_coeval=True,
+    )
+    params = algo.default_params
+    rng = np.random.default_rng(0)
+    pop = rng.normal(size=(n_particles, n_var)).astype(np.float32)
+    fit = np.sum(pop * pop, axis=1).astype(np.float32)
+
+    key = jax.random.key(0)
+    key, k_init = jax.random.split(key)
+    state = algo.init(k_init, jnp.asarray(pop), jnp.asarray(fit), params)
+    pbest_before = np.asarray(state.population_best)
+
+    key, k_ask = jax.random.split(key)
+    asked, state = algo.ask(k_ask, state, params)
+    asked_np = np.asarray(asked)
+    assert asked_np.shape == (2 * n_particles, n_var)
+    np.testing.assert_allclose(asked_np[n_particles:], pbest_before, atol=1e-6)
+    # Offspring must differ from stacked incumbents in general.
+    assert not np.allclose(asked_np[:n_particles], asked_np[n_particles:])
+
+
+def test_pso_ea_coeval_tell_uses_same_batch_pbest_fitness():
+    """With ea_coeval, pbest replacement uses co-evaluated incumbent fitness."""
+    n_particles, n_var = 3, 2
+    algo = FixedPSO(
+        population_size=n_particles,
+        solution=jnp.zeros(n_var),
+        ea_coeval=True,
+    )
+    params = algo.default_params
+    pop = jnp.array([[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]], dtype=jnp.float32)
+    fit = jnp.array([1.0, 4.0, 9.0], dtype=jnp.float32)
+
+    key = jax.random.key(1)
+    key, k_init = jax.random.split(key)
+    state = algo.init(k_init, pop, fit, params)
+
+    # Offspring worse on absolute scale than stale fitness_best[0]=1, but
+    # better than re-evaluated pbest on this batch (fit_p=5).
+    offspring = jnp.array([[0.5, 0.0], [2.0, 0.0], [3.0, 0.0]], dtype=jnp.float32)
+    fit_x = jnp.array([2.0, 4.0, 9.0], dtype=jnp.float32)
+    fit_p = jnp.array([5.0, 4.0, 9.0], dtype=jnp.float32)
+    population = jnp.concatenate([offspring, pop], axis=0)
+    fitness = jnp.concatenate([fit_x, fit_p], axis=0)
+
+    key, k_tell = jax.random.split(key)
+    state, _ = algo.tell(k_tell, population, fitness, state, params)
+
+    # Particle 0: 2.0 <= 5.0 → replace pbest with offspring.
+    assert jnp.allclose(state.population_best[0], offspring[0])
+    assert float(state.fitness_best[0]) == 2.0
+    # Particle 1: 4.0 <= 4.0 → replace (tie).
+    assert jnp.allclose(state.population_best[1], offspring[1])
+    # Archive best is offspring[0] at fitness 2.0.
+    assert jnp.allclose(state.best_solution, offspring[0])
+    assert float(state.best_fitness) == 2.0
+
+
 def test_upstream_pso_loses_init_optimum():
     """Document the upstream bug that FixedPSO repairs."""
     from evosax.algorithms import PSO
