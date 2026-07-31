@@ -65,6 +65,13 @@ from evotinyml.soo.es import (
     DEFAULT_PSO_INERTIA,
     DEFAULT_PSO_MAX_VELOCITY,
     DEFAULT_PSO_SOCIAL,
+    DEFAULT_MOM_PSO_BETA1,
+    DEFAULT_MOM_PSO_BETA2,
+    DEFAULT_MOM_PSO_ETA_GLOBAL,
+    DEFAULT_MOM_PSO_ETA_PERSONAL,
+    DEFAULT_MOM_PSO_GATE_EMA_DECAY,
+    DEFAULT_MOM_PSO_GATE_TEMPERATURE,
+    DEFAULT_MOM_PSO_GLOBAL_TOPK_FRACTION,
     DEFAULT_SPARSE_ES_MASK_PROB,
     ADAPTIVE_SIGMA_ALGOS,
     ES_OPTIMS,
@@ -72,7 +79,9 @@ from evotinyml.soo.es import (
     ES_SIGMA_SCHEDULERS,
     EVOSAX_SOO_ALGOS,
     MEAN_OPTIMIZER_ALGOS,
+    MOM_PSO_ALGOS,
     POPULATION_BASED_ALGOS,
+    PSO_ALGOS,
     SIGMA_SCHEDULE_ALGOS,
     build_soo_wandb_config,
     default_soo_popsize,
@@ -187,7 +196,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optimizer: nsga2 / nsga3 (MOO), cmaes / snes / xnes / open_es / "
             "sparse_open_es / ada_open_es / cr_fm_nes / asebo / lm_ma_es / de / "
-            "jde / pso "
+            "jde / pso / 1m_pso / 2m_pso "
             "(SOO: ERM or weighted-sum scalarization of any MOO problem), "
             "or mgda_open_es / upgrad_open_es / moead_open_es "
             "(multi-objective OpenES on vector problems, e.g. cwrm_cross_entropy)."
@@ -314,7 +323,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             f"Mean-update optimizer (optax) for open_es / sparse_open_es / snes / xnes / asebo. "
             f"Default: {DEFAULT_ES_OPTIM}. "
-            "Ignored for cmaes / cr_fm_nes / lm_ma_es / de / jde / pso."
+            "Ignored for cmaes / cr_fm_nes / lm_ma_es / de / jde / pso / 1m_pso / 2m_pso."
         ),
     )
     parser.add_argument(
@@ -324,7 +333,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             f"Optimizer learning rate for open_es / sparse_open_es / snes / xnes / asebo "
             f"(initial value if scheduled). Default: {DEFAULT_ES_OPTIM_LR}. "
-            "Ignored for cmaes / cr_fm_nes / lm_ma_es / de / jde / pso."
+            "Ignored for cmaes / cr_fm_nes / lm_ma_es / de / jde / pso / 1m_pso / 2m_pso."
         ),
     )
     parser.add_argument(
@@ -336,7 +345,7 @@ def parse_args() -> argparse.Namespace:
             "constant, cosine (decay to 0 over steps), or exponential "
             "(staircase ×0.9 every data-epoch = n_train // batch_size gens, "
             "floor 1e-6; same as --es-sigma-scheduler exponential). "
-            "Ignored for cmaes / cr_fm_nes / lm_ma_es / de / jde / pso."
+            "Ignored for cmaes / cr_fm_nes / lm_ma_es / de / jde / pso / 1m_pso / 2m_pso."
         ),
     )
     parser.add_argument(
@@ -346,7 +355,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             f"Momentum for sgd / rmsprop (0 = off) on open_es / sparse_open_es / snes / xnes / asebo. "
             f"Default: {DEFAULT_ES_OPTIM_MOMENTUM}. "
-            "Ignored for adam/adamw and cmaes / cr_fm_nes / lm_ma_es / de / jde / pso."
+            "Ignored for adam/adamw and cmaes / cr_fm_nes / lm_ma_es / de / jde / pso / 1m_pso / 2m_pso."
         ),
     )
     parser.add_argument(
@@ -357,7 +366,7 @@ def parse_args() -> argparse.Namespace:
             f"Weight decay for mean Optax update on open_es / sparse_open_es / snes / xnes / asebo "
             f"(0 = off). adamw: decoupled WD; sgd / adam / rmsprop: add_decayed_weights. "
             f"Default: {DEFAULT_ES_OPTIM_WD}. "
-            "Ignored for cmaes / cr_fm_nes / lm_ma_es / de / jde / pso."
+            "Ignored for cmaes / cr_fm_nes / lm_ma_es / de / jde / pso / 1m_pso / 2m_pso."
         ),
     )
     parser.add_argument(
@@ -369,7 +378,7 @@ def parse_args() -> argparse.Namespace:
             "constant, cosine, or exponential. Start value is --init-sigma. "
             "exponential: staircase ×0.9 every data-epoch (n_train // batch_size gens), "
             "floored at --es-sigma-end (default 1e-6). "
-            "Ignored for cmaes / snes / xnes / cr_fm_nes / lm_ma_es / de / jde / pso."
+            "Ignored for cmaes / snes / xnes / cr_fm_nes / lm_ma_es / de / jde / pso / 1m_pso / 2m_pso."
         ),
     )
     parser.add_argument(
@@ -564,10 +573,75 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_EA_COEVAL,
         help=(
-            "PSO: ask returns [offspring; personal-best archive] so both are "
-            "evaluated on the same minibatch (2×popsize FEs/gen); tell replaces "
-            "pbest/gbest using that co-batch fitness. "
+            "PSO only: ask returns [offspring; personal-best archive] so both "
+            "are evaluated on the same minibatch (2×popsize FEs/gen); tell "
+            "replaces pbest/gbest using that co-batch fitness. "
+            "Ignored for 1m_pso / 2m_pso (always co-evaluate [x; p; g]). "
             f"Default: {DEFAULT_EA_COEVAL}."
+        ),
+    )
+    parser.add_argument(
+        "--mom-pso-eta-personal",
+        type=float,
+        default=DEFAULT_MOM_PSO_ETA_PERSONAL,
+        help=(
+            "1m_pso / 2m_pso personal-anchor learning rate η_p. "
+            "Default: 0.3 for 1m_pso, 1e-3 for 2m_pso."
+        ),
+    )
+    parser.add_argument(
+        "--mom-pso-eta-global",
+        type=float,
+        default=DEFAULT_MOM_PSO_ETA_GLOBAL,
+        help=(
+            "1m_pso / 2m_pso global-anchor learning rate η_g. "
+            "Default: 0.1 for 1m_pso, 1e-3 for 2m_pso."
+        ),
+    )
+    parser.add_argument(
+        "--mom-pso-beta1",
+        type=float,
+        default=DEFAULT_MOM_PSO_BETA1,
+        help=(
+            f"1m_pso / 2m_pso first-moment decay β1. Default: {DEFAULT_MOM_PSO_BETA1}."
+        ),
+    )
+    parser.add_argument(
+        "--mom-pso-beta2",
+        type=float,
+        default=DEFAULT_MOM_PSO_BETA2,
+        help=(
+            f"2m_pso second-moment decay β2. Default: {DEFAULT_MOM_PSO_BETA2}."
+        ),
+    )
+    parser.add_argument(
+        "--mom-pso-gate-temperature",
+        type=float,
+        default=DEFAULT_MOM_PSO_GATE_TEMPERATURE,
+        help=(
+            "1m_pso / 2m_pso absolute soft-gate temperature τ in loss units "
+            "(γ = sigmoid((q-a)/τ)). Smaller values sharpen gating. "
+            f"Default: {DEFAULT_MOM_PSO_GATE_TEMPERATURE}."
+        ),
+    )
+    parser.add_argument(
+        "--mom-pso-gate-ema-decay",
+        type=float,
+        default=DEFAULT_MOM_PSO_GATE_EMA_DECAY,
+        help=(
+            "1m_pso / 2m_pso EMA decay for the tracked paired-fitness MAD "
+            "spread (not used to scale τ). "
+            f"Default: {DEFAULT_MOM_PSO_GATE_EMA_DECAY}."
+        ),
+    )
+    parser.add_argument(
+        "--mom-pso-global-topk-fraction",
+        type=float,
+        default=DEFAULT_MOM_PSO_GLOBAL_TOPK_FRACTION,
+        help=(
+            "1m_pso / 2m_pso fraction of current particles used in the "
+            "rank-weighted global-anchor pull. Must be in (0, 1]. "
+            f"Default: {DEFAULT_MOM_PSO_GLOBAL_TOPK_FRACTION}."
         ),
     )
     parser.add_argument(
@@ -1202,13 +1276,34 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
         or float(args.pso_social) != DEFAULT_PSO_SOCIAL
         or float(args.pso_max_velocity) != DEFAULT_PSO_MAX_VELOCITY
     )
-    if algo != "pso" and pso_opts_nondefault:
+    if algo not in PSO_ALGOS and pso_opts_nondefault:
         print(
-            f"Note: --pso-* flags are ignored for --algo {algo} (pso only)."
+            f"Note: --pso-* flags are ignored for --algo {algo} "
+            f"(pso / 1m_pso / 2m_pso only)."
         )
     if algo != "pso" and bool(args.ea_coeval) != DEFAULT_EA_COEVAL:
         print(
             f"Note: --ea-coeval is ignored for --algo {algo} (pso only)."
+        )
+    mom_pso_opts_nondefault = (
+        args.mom_pso_eta_personal is not None
+        or args.mom_pso_eta_global is not None
+        or float(args.mom_pso_beta1) != DEFAULT_MOM_PSO_BETA1
+        or float(args.mom_pso_beta2) != DEFAULT_MOM_PSO_BETA2
+        or (
+            float(args.mom_pso_gate_temperature)
+            != DEFAULT_MOM_PSO_GATE_TEMPERATURE
+        )
+        or float(args.mom_pso_gate_ema_decay) != DEFAULT_MOM_PSO_GATE_EMA_DECAY
+        or (
+            float(args.mom_pso_global_topk_fraction)
+            != DEFAULT_MOM_PSO_GLOBAL_TOPK_FRACTION
+        )
+    )
+    if algo not in MOM_PSO_ALGOS and mom_pso_opts_nondefault:
+        print(
+            f"Note: --mom-pso-* flags are ignored for --algo {algo} "
+            f"(1m_pso / 2m_pso only)."
         )
 
     popsize = _resolve_popsize(args, problem.n_var)
@@ -1294,14 +1389,36 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
             f"jde_tau_f={args.jde_tau_f}  jde_tau_cr={args.jde_tau_cr}  "
             f"jde_elitism={args.jde_elitism}"
         )
-    if algo == "pso":
+    if algo in PSO_ALGOS:
         es_banner += (
             f"  pso_inertia={args.pso_inertia}  "
             f"pso_cognitive={args.pso_cognitive}  "
             f"pso_social={args.pso_social}  "
-            f"pso_max_velocity={args.pso_max_velocity}  "
-            f"ea_coeval={args.ea_coeval}"
+            f"pso_max_velocity={args.pso_max_velocity}"
         )
+        if algo == "pso":
+            es_banner += f"  ea_coeval={args.ea_coeval}"
+        else:
+            eta_p = (
+                args.mom_pso_eta_personal
+                if args.mom_pso_eta_personal is not None
+                else ("0.3" if algo == "1m_pso" else "1e-3")
+            )
+            eta_g = (
+                args.mom_pso_eta_global
+                if args.mom_pso_eta_global is not None
+                else ("0.1" if algo == "1m_pso" else "1e-3")
+            )
+            es_banner += (
+                f"  coeval=[x;p;g]  "
+                f"eta_p={eta_p}  eta_g={eta_g}  "
+                f"beta1={args.mom_pso_beta1}  "
+                f"gate_temp={args.mom_pso_gate_temperature}  "
+                f"gate_ema={args.mom_pso_gate_ema_decay}  "
+                f"global_topk={args.mom_pso_global_topk_fraction}"
+            )
+            if algo == "2m_pso":
+                es_banner += f"  beta2={args.mom_pso_beta2}"
 
     sol_tag = "best" if algo in POPULATION_BASED_ALGOS else "mean"
     w_str = ",".join(f"{x:g}" for x in args.scalar_weights_resolved)
@@ -1365,6 +1482,13 @@ def run_soo(args: argparse.Namespace, problem, test_loader, num_classes: int, ba
             pso_social=args.pso_social,
             pso_max_velocity=args.pso_max_velocity,
             ea_coeval=args.ea_coeval,
+            mom_pso_eta_personal=args.mom_pso_eta_personal,
+            mom_pso_eta_global=args.mom_pso_eta_global,
+            mom_pso_beta1=args.mom_pso_beta1,
+            mom_pso_beta2=args.mom_pso_beta2,
+            mom_pso_gate_temperature=args.mom_pso_gate_temperature,
+            mom_pso_gate_ema_decay=args.mom_pso_gate_ema_decay,
+            mom_pso_global_topk_fraction=args.mom_pso_global_topk_fraction,
         )
     except Exception:
         finish_wandb()

@@ -13,4 +13,6 @@ SOO_ALGORITHMS = (
     "de",
     "jde",
     "pso",
+    "1m_pso",
+    "2m_pso",
 )

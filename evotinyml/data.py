@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ssl
+from collections.abc import Callable
 
 import numpy as np
 import torch
@@ -23,6 +24,10 @@ except ImportError:
 
 DATASETS = ("mnist", "mnist_2cls", "cifar10")
 
+# Standard per-channel CIFAR-10 training-set statistics.
+CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
+CIFAR10_STD = (0.2470, 0.2435, 0.2616)
+
 
 def _filter_labels(dataset: Dataset, keep_labels: tuple[int, ...]) -> Subset:
     """Keep only samples whose label is in ``keep_labels`` (labels unchanged)."""
@@ -35,23 +40,41 @@ def _filter_labels(dataset: Dataset, keep_labels: tuple[int, ...]) -> Subset:
 
 
 def load_dataset(name: str, root: str = "./data", train: bool = True) -> tuple[Dataset, int]:
-    """Load a supported image dataset with a simple ToTensor transform.
+    """Load a supported image dataset with train/evaluation transforms.
 
     Returns ``(dataset, num_classes)``. ``mnist_2cls`` keeps digits {0, 1}
     (labels already in ``{0, 1}``), so CWRM / class-balanced sampling use
-    ``n_obj = num_classes = 2``.
+    ``n_obj = num_classes = 2``. CIFAR-10 training images receive standard
+    random-crop and horizontal-flip augmentation; both train and test images
+    are normalized with CIFAR-10 channel statistics.
     """
     name = name.lower()
-    transform = transforms.ToTensor()
     if name == "mnist":
+        transform = transforms.ToTensor()
         dataset: Dataset = datasets.MNIST(
             root=root, train=train, download=True, transform=transform
         )
         return dataset, 10
     if name == "mnist_2cls":
+        transform = transforms.ToTensor()
         full = datasets.MNIST(root=root, train=train, download=True, transform=transform)
         return _filter_labels(full, (0, 1)), 2
     if name == "cifar10":
+        cifar_steps: list[Callable] = []
+        if train:
+            cifar_steps.extend(
+                [
+                    transforms.RandomCrop(32, padding=4),
+                    transforms.RandomHorizontalFlip(),
+                ]
+            )
+        cifar_steps.extend(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD),
+            ]
+        )
+        transform = transforms.Compose(cifar_steps)
         dataset = datasets.CIFAR10(
             root=root, train=train, download=True, transform=transform
         )
