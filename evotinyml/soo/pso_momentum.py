@@ -1,9 +1,10 @@
-"""Soft-replacement PSO with learning-rate momentum on anchors.
+"""Soft-replacement PSO with gated anchor updates.
 
-Two algorithms (see ``contexts/pso_momentum.md``):
+Algorithms (see ``contexts/pso_momentum.md``):
 
-- ``FirstMomentumPSO`` (1MPSO): first-moment EMA of gated displacements.
-  Step stays proportional to ``(x - p)``.
+- ``SoftMomentumPSO`` (SoftMPSO): heavy-ball momentum on gated displacements
+  ``m ← β m + γ(x-p)``, then ``p ← p + m`` (no separate η / bias correction).
+- ``FirstMomentumPSO`` (1MPSO): EMA first-moment of gated displacements with η.
 - ``SecondMomentumPSO`` (2MPSO): Adam-style first + second moments.
   Steps are roughly ``η · sign(x - p)``, so use much smaller ``η``.
 
@@ -219,6 +220,120 @@ class _SoftAnchorPSO(PopulationBasedAlgorithm):
             keys, state.velocity, state.population, state.population_best
         )
         return state.replace(population=x, velocity=velocity)
+
+
+# ---------------------------------------------------------------------------
+# SoftMPSO — heavy-ball momentum (no η / bias correction)
+# ---------------------------------------------------------------------------
+
+
+@struct.dataclass
+class SoftMomentumState(BaseState):
+    population: Population
+    fitness: Fitness
+    population_best: Population
+    fitness_best: Fitness
+    velocity: jax.Array
+    m_personal: jax.Array
+    m_global: jax.Array
+    gate_spread: jax.Array
+
+
+@struct.dataclass
+class SoftMomentumParams(SoftPSOParams):
+    pass
+
+
+class SoftMomentumPSO(_SoftAnchorPSO):
+    """Soft PSO with heavy-ball momentum on gated displacements.
+
+    ``m ← β m + γ(x - p)``, then ``p ← p + m`` (and likewise for ``g``).
+    ``eta_*`` fields exist for param-schema compatibility but are unused.
+    """
+
+    _algo_name = "SoftMomentumPSO"
+
+    @property
+    def _default_params(self) -> SoftMomentumParams:
+        return SoftMomentumParams(
+            inertia_coeff=0.75,
+            cognitive_coeff=1.5,
+            social_coeff=2.0,
+            v_max=0.8,
+            # Unused by SoftMPSO (p ← p + m); kept for SoftPSOParams schema.
+            eta_personal=1.0,
+            eta_global=1.0,
+            beta1=0.9,
+            gate_temperature=0.75,
+            gate_ema_decay=0.9,
+            global_topk_fraction=0.2,
+            eps=1e-8,
+        )
+
+    def _init(self, key: jax.Array, params: SoftMomentumParams) -> SoftMomentumState:
+        n, d = self.population_size, self.num_dims
+        return SoftMomentumState(
+            population=jnp.full((n, d), jnp.nan),
+            fitness=jnp.full((n,), jnp.inf),
+            population_best=jnp.full((n, d), jnp.nan),
+            fitness_best=jnp.full((n,), jnp.inf),
+            velocity=jnp.zeros((n, d)),
+            m_personal=jnp.zeros((n, d)),
+            m_global=jnp.zeros((d,)),
+            gate_spread=jnp.asarray(0.0),
+            best_solution=jnp.full((d,), jnp.nan),
+            best_fitness=jnp.inf,
+            generation_counter=0,
+        )
+
+    @partial(jax.jit, static_argnames=("self",))
+    def init(
+        self,
+        key: jax.Array,
+        population: Population,
+        fitness: Fitness,
+        params: SoftMomentumParams,
+    ) -> SoftMomentumState:
+        state = self._init(key, params)
+        population = jax.vmap(self._ravel_solution)(population)
+        best_idx = jnp.argmin(fitness)
+        shaped = self.fitness_shaping_fn(population, fitness, state, params)
+        return state.replace(
+            population=population,
+            fitness=shaped,
+            best_solution=population[best_idx],
+            best_fitness=fitness[best_idx],
+            population_best=population,
+            fitness_best=fitness,
+        )
+
+    def _soft_update_anchors(
+        self,
+        x: jax.Array,
+        p: jax.Array,
+        g: jax.Array,
+        a: jax.Array,
+        q: jax.Array,
+        qg: jax.Array,
+        state: SoftMomentumState,
+        params: SoftMomentumParams,
+    ) -> SoftMomentumState:
+        s_p, s_g, a_star, gate_spread = self._gated_steps(
+            x, p, g, a, q, qg, state.gate_spread, params
+        )
+        beta1 = params.beta1
+        m_p = beta1 * state.m_personal + s_p
+        m_g = beta1 * state.m_global + s_g
+        return state.replace(
+            population=x,
+            population_best=p + m_p,
+            fitness_best=q,
+            best_solution=g + m_g,
+            best_fitness=a_star,
+            m_personal=m_p,
+            m_global=m_g,
+            gate_spread=gate_spread,
+        )
 
 
 # ---------------------------------------------------------------------------

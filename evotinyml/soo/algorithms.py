@@ -13,6 +13,7 @@ SOO_ALGORITHMS = (
     "de",
     "jde",
     "pso",
+    "soft_m_pso",
     "1m_pso",
     "2m_pso",
 )

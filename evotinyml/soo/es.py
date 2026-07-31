@@ -45,6 +45,7 @@ EVOSAX_SOO_ALGOS = {
     "de": ("DifferentialEvolution", "DE"),
     "jde": ("JDE", "jDE"),
     "pso": ("PSO", "PSO"),
+    "soft_m_pso": ("SoftMomentumPSO", "SoftMPSO"),
     "1m_pso": ("FirstMomentumPSO", "1MPSO"),
     "2m_pso": ("SecondMomentumPSO", "2MPSO"),
 }
@@ -62,11 +63,13 @@ SIGMA_SCHEDULE_ALGOS = frozenset({"open_es", "sparse_open_es", "asebo"})
 # Self-adapted per-parameter σ (no schedule; --es-sigma-lr/-min/-max instead).
 ADAPTIVE_SIGMA_ALGOS = frozenset({"ada_open_es"})
 # Population-based (init with evaluated population; report best member).
-POPULATION_BASED_ALGOS = frozenset({"de", "jde", "pso", "1m_pso", "2m_pso"})
+POPULATION_BASED_ALGOS = frozenset(
+    {"de", "jde", "pso", "soft_m_pso", "1m_pso", "2m_pso"}
+)
 # Algos that accept --pso-* swarm coefficients / velocity clamp.
-PSO_ALGOS = frozenset({"pso", "1m_pso", "2m_pso"})
+PSO_ALGOS = frozenset({"pso", "soft_m_pso", "1m_pso", "2m_pso"})
 # Soft-replacement momentum PSO variants (co-eval [x; p; g]).
-MOM_PSO_ALGOS = frozenset({"1m_pso", "2m_pso"})
+MOM_PSO_ALGOS = frozenset({"soft_m_pso", "1m_pso", "2m_pso"})
 
 # Momentum (--es-optim-momentum) applies to sgd and rmsprop only.
 ES_OPTIMS = ("sgd", "adam", "adamw", "rmsprop")
@@ -116,7 +119,7 @@ DEFAULT_PSO_MAX_VELOCITY = 0.8
 # When True, ask returns [offspring; personal-best archive] (2×popsize FEs/gen).
 DEFAULT_EA_COEVAL = False
 # Soft-replacement MomPSO anchor LRs. None → use each algo's class defaults
-# (1m_pso: 0.3/0.1; 2m_pso: 1e-3/1e-3).
+# (1m_pso: 0.3/0.1; 2m_pso: 1e-3/1e-3). Ignored by soft_m_pso (p ← p + m).
 DEFAULT_MOM_PSO_ETA_PERSONAL = None
 DEFAULT_MOM_PSO_ETA_GLOBAL = None
 DEFAULT_MOM_PSO_BETA1 = 0.9
@@ -523,7 +526,11 @@ def _build_evosax(
         xNES,
     )
     from evotinyml.soo.pso_fixed import FixedPSO
-    from evotinyml.soo.pso_momentum import FirstMomentumPSO, SecondMomentumPSO
+    from evotinyml.soo.pso_momentum import (
+        FirstMomentumPSO,
+        SecondMomentumPSO,
+        SoftMomentumPSO,
+    )
 
     if algo not in EVOSAX_SOO_ALGOS:
         raise ValueError(
@@ -547,6 +554,8 @@ def _build_evosax(
         Cls = JDE
     elif algo == "pso":
         Cls = FixedPSO
+    elif algo == "soft_m_pso":
+        Cls = SoftMomentumPSO
     elif algo == "1m_pso":
         Cls = FirstMomentumPSO
     elif algo == "2m_pso":
@@ -602,7 +611,7 @@ def _build_evosax(
         kwargs["mask_prob"] = float(sparse_es_mask_prob)
     if algo == "pso":
         kwargs["ea_coeval"] = bool(ea_coeval)
-    # 1m_pso / 2m_pso always co-evaluate [x; p; g] (2*popsize+1).
+    # soft_m_pso / 1m_pso / 2m_pso always co-evaluate [x; p; g] (2*popsize+1).
 
     es = Cls(**kwargs)
     params = es.default_params
@@ -662,24 +671,10 @@ def _build_evosax(
             v_max=v_max,
         )
     if algo in MOM_PSO_ALGOS:
-        eta_p = (
-            float(params.eta_personal)
-            if mom_pso_eta_personal is None
-            else float(mom_pso_eta_personal)
-        )
-        eta_g = (
-            float(params.eta_global)
-            if mom_pso_eta_global is None
-            else float(mom_pso_eta_global)
-        )
         beta1 = float(mom_pso_beta1)
         gate_temperature = float(mom_pso_gate_temperature)
         gate_ema_decay = float(mom_pso_gate_ema_decay)
         global_topk_fraction = float(mom_pso_global_topk_fraction)
-        if eta_p <= 0.0:
-            raise ValueError(f"mom_pso_eta_personal must be > 0, got {eta_p}")
-        if eta_g <= 0.0:
-            raise ValueError(f"mom_pso_eta_global must be > 0, got {eta_g}")
         if not (0.0 <= beta1 < 1.0):
             raise ValueError(f"mom_pso_beta1 must be in [0, 1), got {beta1}")
         if gate_temperature <= 0.0:
@@ -698,13 +693,29 @@ def _build_evosax(
                 f"got {global_topk_fraction}"
             )
         replace_kw: dict[str, float] = {
-            "eta_personal": eta_p,
-            "eta_global": eta_g,
             "beta1": beta1,
             "gate_temperature": gate_temperature,
             "gate_ema_decay": gate_ema_decay,
             "global_topk_fraction": global_topk_fraction,
         }
+        # soft_m_pso uses p ← p + m (no η); keep class defaults.
+        if algo in {"1m_pso", "2m_pso"}:
+            eta_p = (
+                float(params.eta_personal)
+                if mom_pso_eta_personal is None
+                else float(mom_pso_eta_personal)
+            )
+            eta_g = (
+                float(params.eta_global)
+                if mom_pso_eta_global is None
+                else float(mom_pso_eta_global)
+            )
+            if eta_p <= 0.0:
+                raise ValueError(f"mom_pso_eta_personal must be > 0, got {eta_p}")
+            if eta_g <= 0.0:
+                raise ValueError(f"mom_pso_eta_global must be > 0, got {eta_g}")
+            replace_kw["eta_personal"] = eta_p
+            replace_kw["eta_global"] = eta_g
         if algo == "2m_pso":
             beta2 = float(mom_pso_beta2)
             if not (0.0 <= beta2 < 1.0):
@@ -793,7 +804,7 @@ def run_soo_es(
     for DE / jDE / PSO.
 
     Function Evaluations: each ``ask`` costs ``len(candidates)`` FEs (PSO with
-    ``ea_coeval`` returns ``2 * popsize``; ``1m_pso`` / ``2m_pso`` return
+    ``ea_coeval`` returns ``2 * popsize``; soft / 1m / 2m PSO return
     ``2 * popsize + 1``).
     Population-based algos also evaluate
     the initial population (``popsize``), then run ask/tell generations until
@@ -1033,7 +1044,7 @@ def run_soo_es(
         mean_f_hist.append(sol_f)
         completed_steps = gen
 
-        # PSO ea_coeval / 1m_pso / 2m_pso ask stacks anchors; report x best only.
+        # PSO ea_coeval / soft_m_pso / 1m_pso / 2m_pso ask stacks anchors; report x best only.
         pop_best_f = float(np.min(fitness[:popsize]))
         cur_sigma = _current_sigma_scalar(algo, state, sigma_schedule, gen - 1)
         cur_lr = sigma_at(lr_schedule, gen - 1) if lr_schedule is not None else None
@@ -1266,7 +1277,7 @@ def build_soo_wandb_config(
         DEFAULT_MOM_PSO_GLOBAL_TOPK_FRACTION,
     )
     val_solution = "de_best" if algo in POPULATION_BASED_ALGOS else "es_mean"
-    if algo in {"jde", "pso", "1m_pso", "2m_pso"}:
+    if algo in {"jde", "pso", "soft_m_pso", "1m_pso", "2m_pso"}:
         library = f"evosax+{algo}"
     else:
         library = "evosax"

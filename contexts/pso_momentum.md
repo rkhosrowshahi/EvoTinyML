@@ -126,7 +126,10 @@ $$\boxed{\,p_i \leftarrow p_i + \eta_p\,\frac{\hat m^p_i}{\sqrt{\hat u^p_i}+\var
 
 Variants:
 
-- **Pure momentum (no second moment):** $p_i \leftarrow p_i + \eta_p\, \hat m^p_i$, and likewise for $g$.
+- **Soft PSO with momentum (SoftMPSO / `--algo soft_m_pso`):** heavy-ball on the gated step, no separate $\eta$ or bias correction:
+  $$m^p_i \leftarrow \beta\, m^p_i + s^p_i,\qquad p_i \leftarrow p_i + m^p_i$$
+  (and likewise for $g$). Default $\beta=0.9$.
+- **Pure momentum / EMA first moment (1MPSO):** $p_i \leftarrow p_i + \eta_p\, \hat m^p_i$, and likewise for $g$, with $m \leftarrow \beta_1 m + (1-\beta_1)s$.
 - **Plain soft step (no moments):** $p_i \leftarrow p_i + \eta_p\, s^p_i$. This is the minimal form: $p_i \leftarrow p_i + \eta_p\,\gamma^p_i (x_i - p_i)$, i.e. a gated exponential move toward good positions.
 
 Because the update is additive and learning-rate scaled, there is **no comparison to freeze**, so the cross-batch and optimizer's-curse problems cannot occur. The price: if $\gamma$ mis-fires on a bad batch, the anchor drifts slightly wrong, exactly the SGD noise trade-off.
